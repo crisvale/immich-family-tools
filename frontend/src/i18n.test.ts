@@ -11,7 +11,9 @@ import {
   LanguageProvider,
   readStoredLang,
   resolveLang,
+  ERROR_PARAM_ORDER,
   translations,
+  type ServerErrorLike,
   useT,
 } from "./i18n";
 import type { Lang } from "./i18n";
@@ -664,5 +666,170 @@ describe("translations shape", () => {
       }
     }
     expect(leere).toEqual([]);
+  });
+});
+
+describe("errorText", () => {
+  // Der Server schickt Schluessel UND deutschen Klartext. Diese Gruppe
+  // prueft vor allem den RUECKFALL — den Fall, in dem das Frontend den
+  // Schluessel nicht kennt. Das ist kein Randfall: FastAPIs eigene
+  // Validierungsfehler kommen ganz ohne Schluessel (gemessen an der
+  // laufenden API), und jede kuenftige Meldung kommt zuerst ohne
+  // Uebersetzung hier an.
+  // Nimmt den vorhandenen Weg, die Sprache im Provider zu setzen, statt einen
+  // eigenen zu erfinden. Die erste Fassung dieses Helfers nahm `lang`
+  // entgegen und BENUTZTE ES NICHT — vier der sechs Tests blieben trotzdem
+  // gruen, weil sie gar nicht von der Sprache abhaengen. Zwei sind
+  // umgefallen, und nur deshalb ist es aufgefallen.
+  const textFor = (lang: Lang, fehler: ServerErrorLike): string =>
+    capturedContext(fakeStorage(lang)).errorText(fehler);
+
+  it("translates a known key into the selected language", () => {
+    expect(
+      textFor("es-ES", { message: "Account nicht gefunden", key: "err_account_not_found" })
+    ).toBe("Cuenta no encontrada");
+    expect(
+      textFor("pt-BR", { message: "Account nicht gefunden", key: "err_account_not_found" })
+    ).toBe("Conta não encontrada");
+  });
+
+  it("falls back to the server's plain text for an unknown key", () => {
+    // DER WICHTIGSTE TEST DIESES SLICES. Ohne den Rueckfall zeigt die
+    // Oberflaeche "Error:" und nichts dahinter — ein Fehler, den niemand
+    // bemerkt, weil er wie ein leeres Feld aussieht und nicht wie ein Absturz.
+    expect(
+      textFor("es-ES", { message: "Etwas ist schiefgegangen", key: "err_gibt_es_nicht" })
+    ).toBe("Etwas ist schiefgegangen");
+  });
+
+  it("falls back when the server sends no key at all", () => {
+    // Die Form von FastAPIs Validierungsfehlern.
+    expect(textFor("pt-BR", { message: "Unprocessable Entity" })).toBe("Unprocessable Entity");
+  });
+
+  it("never returns an empty string, whatever the server sent", () => {
+    // Die Zusicherung, auf die es ankommt: etwas Lesbares kommt immer.
+    const faelle: ServerErrorLike[] = [
+      { message: "HTTP 500" },
+      { message: "HTTP 500", key: "" },
+      { message: "HTTP 500", key: "err_unbekannt" },
+      { message: "HTTP 500", key: "err_account_not_found" },
+      { message: "HTTP 500", key: "err_account_id_not_found", params: {} },
+    ];
+    for (const lang of Object.keys(LANG_LABELS) as Lang[]) {
+      for (const fall of faelle) {
+        expect(textFor(lang, fall).length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("fills the server's values into a parameterised message", () => {
+    expect(
+      textFor("en", {
+        message: "Account a1 nicht gefunden",
+        key: "err_account_id_not_found",
+        params: { id: "a1" },
+      })
+    ).toBe("Account a1 not found");
+    expect(
+      textFor("es-ES", {
+        message: "...",
+        key: "err_unsupported_immich_version",
+        params: { major: "2", minor: "7" },
+      })
+    ).toContain("2.7");
+  });
+
+  it("falls back to the plain text when a parameterised message arrives without its values", () => {
+    // Frueher stand hier "die Meldung wird dann lueckenhaft, aber sie
+    // erscheint" — und die Zusicherung war entsprechend schwach
+    // (`length > 0`). Die Panel-Stimme hat gezeigt, wie das aussieht:
+    // «undefined» bzw. «» mitten im Satz. Lieber der deutsche Klartext des
+    // Servers als ein Satz mit einer Luecke; der Test haelt jetzt genau das
+    // fest, statt nur "irgendetwas kommt".
+    expect(textFor("de", { message: "Rueckfall", key: "err_account_id_not_found" })).toBe(
+      "Rueckfall"
+    );
+  });
+});
+
+describe("ERROR_PARAM_ORDER", () => {
+  // Die Bruecke zwischen dem Woerterbuch, das der Server schickt, und den
+  // positionellen Argumenten der Uebersetzungen. Sie ist die Stelle, an der
+  // still eine leere oder falsche Zahl erscheint — und die erste Fassung war
+  // nur zu zwei von fuenf Faellen abgedeckt: Eine Mutation, die zwei
+  // Eintraege entfernte, liess alle 66 Tests gruen und zeigte «undefined»
+  // auf der Oberflaeche. Von der blinden Panel-Stimme gefunden.
+  const fehlerSchluessel = (Object.keys(translations) as string[]).filter((k) =>
+    k.startsWith("err_")
+  );
+
+  it("has an entry for every parameterised error key, and only for those", () => {
+    const mitFunktion = fehlerSchluessel.filter((k) => {
+      const werte = (translations as Record<string, Record<string, unknown>>)[k];
+      return typeof werte.de === "function";
+    });
+    expect(Object.keys(ERROR_PARAM_ORDER).sort()).toEqual(mitFunktion.sort());
+  });
+
+  it("names exactly as many parameters as the translation takes arguments", () => {
+    const abweichungen: string[] = [];
+    for (const [key, namen] of Object.entries(ERROR_PARAM_ORDER)) {
+      const fn = (translations as Record<string, Record<string, unknown>>)[key]?.de;
+      if (typeof fn !== "function") {
+        abweichungen.push(`${key}: kein Funktionseintrag`);
+        continue;
+      }
+      if ((fn as (...a: never[]) => string).length !== namen.length) {
+        abweichungen.push(
+          `${key}: ${namen.length} Namen, aber ${(fn as (...a: never[]) => string).length} Argumente`
+        );
+      }
+    }
+    expect(abweichungen).toEqual([]);
+  });
+
+  it("renders every parameterised error with its values, in every language", () => {
+    // Alle fuenf, nicht zwei. Je Schluessel wird geprueft, dass JEDER Wert
+    // im Ergebnis auftaucht — ein vertauschtes oder verschlucktes Argument
+    // faellt damit auf.
+    const werte: Record<string, Record<string, string>> = {
+      err_account_id_not_found: { id: "WERT-A" },
+      err_owner_account_id_not_found: { id: "WERT-B" },
+      err_person_validation_failed: { account: "WERT-C" },
+      err_match_album_exists: { album: "WERT-D" },
+      err_unsupported_immich_version: { major: "WERT-E", minor: "WERT-F" },
+    };
+    expect(Object.keys(werte).sort()).toEqual(Object.keys(ERROR_PARAM_ORDER).sort());
+    for (const lang of Object.keys(LANG_LABELS) as Lang[]) {
+      for (const [key, params] of Object.entries(werte)) {
+        const text = capturedContext(fakeStorage(lang)).errorText({
+          message: "RUECKFALL",
+          key,
+          params,
+        });
+        expect(text).not.toBe("RUECKFALL");
+        for (const wert of Object.values(params)) {
+          expect(text).toContain(wert);
+        }
+      }
+    }
+  });
+
+  it("falls back to the plain text when a value is missing", () => {
+    // Lieber der deutsche Satz des Servers als ein Satz mit einer Luecke.
+    for (const key of Object.keys(ERROR_PARAM_ORDER)) {
+      expect(capturedContext(fakeStorage("es-ES")).errorText({ message: "RUECKFALL", key })).toBe(
+        "RUECKFALL"
+      );
+    }
+  });
+
+  it("ignores a key that is not an error key at all", () => {
+    // Ohne die err_-Schranke schlug ein Tippfehler im GESAMTEN Woerterbuch
+    // nach und lieferte einen fremden Satz.
+    expect(
+      capturedContext(fakeStorage("de")).errorText({ message: "RUECKFALL", key: "nav_accounts" })
+    ).toBe("RUECKFALL");
   });
 });
