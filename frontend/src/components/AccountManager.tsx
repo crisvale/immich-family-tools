@@ -14,7 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { api, Account } from "../api/client";
-import { useT } from "../i18n";
+import { useT, type ServerErrorLike } from "../i18n";
 
 const PRESET_COLORS = [
   "#6366f1", // indigo
@@ -64,6 +64,7 @@ function ColorPicker({ value, onChange }: { value: string; onChange: (c: string)
 }
 
 function StatusDot({ accountId }: { accountId: string }) {
+  const { errorText } = useT();
   const { data, isLoading } = useQuery({
     queryKey: ["account-status", accountId],
     queryFn: () => api.accounts.status(accountId),
@@ -74,14 +75,14 @@ function StatusDot({ accountId }: { accountId: string }) {
   return data.reachable ? (
     <CheckCircle size={14} className="text-emerald-400" />
   ) : (
-    <span title={data.error}>
+    <span title={data.error ? errorText({ message: data.error, key: data.error_key }) : undefined}>
       <XCircle size={14} className="text-red-400" />
     </span>
   );
 }
 
 function EditAccountForm({ account, onClose }: { account: Account; onClose: () => void }) {
-  const { t } = useT();
+  const { t, errorText } = useT();
   const qc = useQueryClient();
   const [name, setName] = useState(account.name);
   const [url, setUrl] = useState(account.immich_url);
@@ -153,7 +154,7 @@ function EditAccountForm({ account, onClose }: { account: Account; onClose: () =
       </div>
 
       {mutation.error && (
-        <p className="text-red-400 text-xs">{(mutation.error as Error).message}</p>
+        <p className="text-red-400 text-xs">{errorText(mutation.error as ServerErrorLike)}</p>
       )}
 
       <div className="flex gap-2">
@@ -233,7 +234,7 @@ function AccountCard({ account, onDelete }: { account: Account; onDelete: () => 
 }
 
 function AddAccountForm({ onClose }: { onClose: () => void }) {
-  const { t } = useT();
+  const { t, errorText } = useT();
   const [name, setName] = useState("");
   const [url, setUrl] = useState("http://192.168.2.3:30041");
   const [key, setKey] = useState("");
@@ -282,7 +283,7 @@ function AddAccountForm({ onClose }: { onClose: () => void }) {
         </div>
       </div>
       {mutation.error && (
-        <p className="text-red-400 text-xs">{(mutation.error as Error).message}</p>
+        <p className="text-red-400 text-xs">{errorText(mutation.error as ServerErrorLike)}</p>
       )}
       <div className="flex gap-2">
         <button
