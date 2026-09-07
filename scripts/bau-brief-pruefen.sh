@@ -45,6 +45,29 @@
 #   zu werden.
 #
 # Ein sauberer Lauf heisst: "nichts vergessen". Nicht: "Brief ist gut".
+# ------------------------------------------------------------------------
+# ABWEICHUNG VON DER VORLAGENFASSUNG — offengelegt als war -> ist -> warum.
+#
+# WAR:  Die Vorlage (v1.14.0) ersetzte literale Umlaute durch einen einzelnen
+#       Punkt: `zweck-identit.t`, `verhalten .nder`, `entf.ll`, `er.brigt`,
+#       `wei. ich nicht`. Der VERBOTE-Block behielt seinen literalen Umlaut und
+#       suchte weiterhin auf der UNBEREINIGTEN Datei.
+# IST:  Diese fuenf Muster benutzen `..?` wie `pr..?ffrage`; der VERBOTE-Block
+#       sucht umlautfrei und auf $BEREINIGT.
+# WARUM: Ein Punkt in einem Muster trifft EIN Byte, ein Umlaut besteht aus
+#       zweien. Gemessen ueber alle sieben Ersatzmuster: unter LC_ALL=C trafen
+#       die fuenf Punkt-Muster null Zeilen, die beiden `..?`-Muster je eine;
+#       unter LC_ALL=C.UTF-8 alle sieben je eine. Der Widerspruch ist im
+#       Artefakt selbst nachweisbar — der Kommentar unten nannte die fuenf
+#       "analog" zu `pr..?ffrage`, was fuer keines von ihnen galt. Und der
+#       VERBOTE-Block bekam den Bereinigungs-Fix derselben Version nicht:
+#       `nicht **aendern**` fand er nie.
+#
+# Gemeldet an die Vorlage als Issue #73. Wir weichen ab, statt zu warten, weil
+# dieses Skript hier VERBINDLICH vor jedem Bau-Brief laeuft und lehren.md §15
+# gilt: Eine Messung, die der Vorlage widerspricht, ist zuerst ein Befund ueber
+# die Vorlage — nicht ein Grund, die eigene Messung umzudeuten.
+# ------------------------------------------------------------------------
 set -e
 
 BRIEF="$1"
@@ -56,18 +79,32 @@ THEMEN="Risiko|risiko: r[0-9]|risiko r[0-9]
 Auftrag|auftrag|zu bauen|gebaut wird|umzusetzen
 Befund|befund|beleg|verifiziert|festgestellt|gemessen|ausgangslage
 Konsumenten|konsument|ruft .* auf|aufrufer|caller|wer ruft
-Sichtbares|sichtbares verhalten|verhalten aender|verhalten änder|handbuch|nutzer-doku|sichtbar
+Sichtbares|sichtbares verhalten|verhalten ..?nder|handbuch|nutzer-doku|sichtbar
 Nachweis|rot-beweis|rotbeweis|sabotier|mutation|nachweis
-Kommandos|gates\.sh|pytest|npm |tsc|prüf-kommando|pruef-kommando
+Kommandos|gates\.sh|pytest|npm |tsc|pr..?f-kommando
 Fixtures|fixture|testdaten|seed
 Randbedingungen|randbedingung|nicht pushen|vordergrund|leitplanke
-Prüffragen|prüffrage|prueffrage|welchen pfad|wahr bleiben|zweck-identität"
+Prüffragen|pr..?ffrage|welchen pfad|wahr bleiben|zweck-identit..?t"
 
-VERNEINUNG="nicht|kein|entfäll|entfall|braucht.*nicht|erübrigt|weiss ich nicht|weiß ich nicht"
+# UMLAUTFREI: "grep -i" faltet ohne Locale kein Ü/Ä/Ö (gemessen: eine
+# Versalien-Ueberschrift "## 9 PRÜFFRAGEN" fiel als [KEIN TREFFER] durch,
+# obwohl der Block vollstaendig war — in genau der Richtung, die dieses
+# Skript belastbar nennt). "pr..?ffrage" trifft prüffrage, prueffrage und
+# PRÜFFRAGE (zwei Bytes Umlaut oder "ue"), analog "zweck-identit.t",
+# "pr..?f-kommando", "verhalten .nder", "entf.ll", "er.brigt".
+VERNEINUNG="nicht|kein|entf..?ll|braucht.*nicht|er..?brigt|weiss ich nicht|wei..? ich nicht"
+
+# AUSZEICHNUNG VOR DER SUCHE ENTFERNEN: "Risiko: **R2**" fiel durch das Muster
+# "risiko: r[0-9]" — ein falsch-negativer Treffer durch Markdown-Fettdruck,
+# also ein Bruch der Asymmetrie. Das Werkzeug passt sich dem Brief an, nicht
+# der Brief dem Werkzeug. Zeilennummern bleiben erhalten (sed arbeitet je Zeile).
+BEREINIGT=$(mktemp)
+sed 's/[*_`]//g' "$BRIEF" > "$BEREINIGT"
+trap 'rm -f "$BEREINIGT"' EXIT
 
 OHNE=0
 echo "Bau-Brief: $BRIEF"
-echo "Kein Treffer ist belastbar. Ein Treffer ist ein KANDIDAT — bitte lesen."
+echo "Kein Treffer ist belastbar (bei Einzelwort-Mustern). Ein Treffer ist ein KANDIDAT — bitte lesen."
 echo
 
 OLDIFS=$IFS
@@ -76,7 +113,7 @@ IFS='
 for Z in $THEMEN; do
   NAME=$(echo "$Z" | cut -d'|' -f1)
   MUSTER=$(echo "$Z" | cut -d'|' -f2-)
-  TREFFER=$(grep -n -i -E "$MUSTER" "$BRIEF" | head -2 || true)
+  TREFFER=$(grep -n -i -E "$MUSTER" "$BEREINIGT" | head -2 || true)
 
   if [ -z "$TREFFER" ]; then
     printf '  [KEIN TREFFER]  %s\n' "$NAME"
@@ -100,7 +137,7 @@ done
 IFS=$OLDIFS
 
 echo
-VERBOTE=$(grep -n -i -E "nicht anfassen|nicht ändern|nicht aendern|finger weg|tabu" "$BRIEF" || true)
+VERBOTE=$(grep -n -i -E "nicht anfassen|nicht ..?ndern|finger weg|tabu" "$BEREINIGT" || true)
 if [ -n "$VERBOTE" ]; then
   echo "HINWEIS — pruefe, ob das eine UMFANGSGRENZE oder ein URTEIL ist:"
   echo "$VERBOTE" | sed 's/^/    /'

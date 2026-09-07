@@ -61,8 +61,9 @@ const KNOWN_LANGS = Object.keys(LANG_LABELS) as Lang[];
 
 /** Validates a raw (e.g. `localStorage`) value against the known languages,
  *  falling back to `"de"` for anything else — including a stale `"br"` from
- *  before the pt-BR rename. Exported so it can be unit-tested without a
- *  DOM/localStorage stub. */
+ *  before the pt-BR rename. Exported so it can be unit-tested as a pure
+ *  function, without standing up a DOM at all — cheaper than the DOM tests
+ *  added in #72, and still the right level for a pure mapping. */
 export function resolveLang(stored: string | null): Lang {
   return KNOWN_LANGS.includes(stored as Lang) ? (stored as Lang) : "de";
 }
@@ -1385,11 +1386,19 @@ const LangContext = createContext<LangContextValue>({
   errorText: (fehler) => renderErrorText("de", fehler),
 });
 
-/** Writes `lang` to `<html lang>`. Pulled out of the effect below into its
- *  own exported function so it can be unit-tested directly against a stub
- *  `document` (this repo has no jsdom) instead of only through a React
- *  effect that `renderToString` never runs. A no-op outside a browser (SSR,
- *  the test file's `renderToString` calls) rather than a DOM dependency. */
+/** Writes `lang` to `<html lang>`. A no-op outside a browser (SSR, the older
+ *  `renderToString` tests) rather than a DOM dependency.
+ *
+ *  It stays a separate exported function, but the ORIGINAL reason for that is
+ *  gone: it used to read "so it can be unit-tested against a stub `document`
+ *  (this repo has no jsdom)". Since #72 the repo has a stateful DOM renderer
+ *  (`happy-dom`), and the call site in `setLang` below is exercised through a
+ *  real click in `src/App.sprachumschalter.test.tsx`. (There is no effect any
+ *  more — it was replaced by that direct call in an earlier round; see the
+ *  comment above `setLang`.) The seam is still worth keeping —
+ *  `src/main.bootstrap.test.tsx` calls it before the first render, and that
+ *  ordering is the whole point — but nobody should read the old sentence and
+ *  conclude that a DOM cannot be tested here. It can, and it is. */
 export function applyDocumentLang(lang: Lang): void {
   if (typeof document !== "undefined") {
     document.documentElement.lang = lang;
