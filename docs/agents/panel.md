@@ -95,7 +95,35 @@ Sitzung ist **kein** Ersatz — es sieht die Historie.
 ### Stimme 2 (GPT über Codex-CLI) — unabhängiges Modell mit Repo-Zugriff
 
 ```bash
-sh /c/Users/manue/.claude/Immich/model-panel/codex.sh exec --skip-git-repo-check --sandbox read-only -c 'model_reasoning_effort="high"' '<Prüfauftrag>'
+sh /c/Users/manue/.claude/Immich/model-panel/codex.sh exec --skip-git-repo-check -c 'model_reasoning_effort="high"' '<Prüfauftrag>'
+```
+
+**`--sandbox read-only` steht hier seit 06.09.2026 nicht mehr, und der Grund
+ist kein Stilfrage.** Die Stimme lief eineinhalb Wochen als AUSFALL, weil
+Codex innerhalb unseres Containers noch eine eigene Bubblewrap-Sandbox
+aufbauen wollte und daran scheiterte (`bwrap: No permissions to create a new
+namespace`). Der Wrapper setzt jetzt
+`--dangerously-bypass-approvals-and-sandbox` — Codex nennt das Flag selbst
+„intended solely for running in environments that are externally sandboxed",
+und der Container **ist** diese Umgebung.
+
+**Der Schutz liegt seitdem im Mount, nicht in der inneren Sandbox:** Der
+Wrapper hängt das Arbeitsverzeichnis **schreibgeschützt** ein. Das ist
+strenger als vorher — mit `--sandbox workspace-write` hätte eine Stimme in den
+echten Arbeitsbaum schreiben können. Gemessen, beide Richtungen: Die
+Vorabprüfung liefert den erwarteten `HEAD` zurück; ein Schreibversuch endet mit
+`Failed to write file /work/…`, und im Arbeitsbaum entsteht nichts.
+(Wer wirklich schreiben muss — Bau statt Review — setzt `CODEX_RW=1`. Für eine
+Panel-Stimme ist das falsch.)
+
+**Was der Mount NICHT ersetzt: die Quellen-Regel.** Der Wrapper hängt das
+_aktuelle Verzeichnis_ ein, nicht den geprüften Commit. Für ein Panel gehört
+die Stimme deshalb weiterhin auf einen Wegwerf-Klon oder Worktree auf dem
+gemessenen Stand:
+
+```bash
+git clone -q --no-hardlinks . ../codex-klon && git -C ../codex-klon checkout -q <commit>
+cd ../codex-klon && sh …/codex.sh exec --skip-git-repo-check -c 'model_reasoning_effort="high"' '<Prüfauftrag>'
 ```
 
 Kennt den lokalen Arbeitsbaum nicht — sie braucht den gepushten Review-Zweig.
@@ -527,8 +555,20 @@ diesem Projekt ist deshalb nicht „sag Hallo", sondern ein Kommando, dessen
 Ausgabe zurückkommen muss:
 
 ```bash
-sh /c/Users/manue/.claude/Immich/model-panel/codex.sh exec --skip-git-repo-check --sandbox read-only -c 'model_reasoning_effort="high"' 'git rev-parse HEAD'
+sh /c/Users/manue/.claude/Immich/model-panel/codex.sh exec --skip-git-repo-check -c 'model_reasoning_effort="high"' 'git rev-parse HEAD'
 ```
+
+Die Ausgabe wird gegen den **erwarteten** Stand verglichen, nicht nur auf
+Anwesenheit geprüft — sonst besteht auch eine Stimme, die im falschen
+Verzeichnis steht.
+
+**Nachtrag 06.09.2026, und er gehört hierher, weil die Lehre die Diagnose
+betrifft:** Der `bwrap`-Ausfall galt eineinhalb Wochen als Eigenschaft der
+Umgebung. Er war keine — er war eine **verschachtelte** Sandbox, und die
+Ursache stand die ganze Zeit in der Fehlermeldung. Behoben (siehe „Stimme 2"
+oben). Wer einen Werkzeugausfall als gegeben notiert, statt seine Ursache zu
+lesen, verliert eine Stimme auf Dauer: Der Ausfall-Vermerk ist ehrlich, aber
+er ist keine Diagnose, und er wird mit jeder Runde selbstverständlicher.
 
 ## Stimmen mit Repo-Zugriff arbeiten in eigenen Worktrees
 
