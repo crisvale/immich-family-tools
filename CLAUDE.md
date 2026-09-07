@@ -234,7 +234,19 @@ nicht):\*\*
   seine Abdeckung reine Behauptung. Sie fährt echte Commits in Wegwerf-Repos
   und prüft, was git **speichert**, nicht nur, was der Hook sieht.
 - Frontend (in `frontend/`): `npm ci`
-- Frontend (in `frontend/`): `npm test`
+- Frontend (in `frontend/`): `npm test` — seit #72 unter einem **echten DOM**
+  (`happy-dom`, gewählt gegen `jsdom`: gemessen +9 statt +37 Pakete im Baum —
+  wobei die Paketzahl die Lieferkette misst, nicht die DOM-Treue; die
+  zweite Seite der Abwägung ist ungemessen).
+  Damit prüfen die Tests nicht mehr nur, was eine Funktion zurückgibt,
+  sondern was passiert, wenn jemand klickt. `src/test-setup.ts` räumt nach
+  jedem Test auf — **nur mit `cleanup()`, weil nur das rot-beweisbar ist**:
+  Entfernt man es, fallen zwei Testdateien. Zwei weitere Zeilen standen dort
+  eine Fassung lang (Speicher leeren, `<html lang>` zurücksetzen) und
+  überlebten den Mutationslauf, weil jeder Test seinen Ausgangszustand selbst
+  setzt; sie sind entfernt. Bewusst **ohne** `globals: true` — der Schalter
+  aktiviert die automatische Aufräumroutine der Testbibliothek, und solange
+  die läuft, ist die eigene wirkungslos und damit unbeweisbar.
 - Frontend (in `frontend/`): `npm run build` (enthält `tsc`)
 - Container: `docker build` des Gesamt-Images (`push: false`, reiner Bau-Test)
 - Secrets: `gitleaks` gegen die Commits des Pushes entlang der ersten
