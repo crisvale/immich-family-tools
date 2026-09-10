@@ -78,6 +78,8 @@ Then open **Albums** and choose **Create conditional album**. You can select lin
 
 The rule is evaluated from Immich's paginated person searches rather than from face data embedded in asset responses. It is therefore compatible with Immich 3.x, and the same rule is applied again by manual and scheduled album refreshes. Synchronization is additive: matching photos are added, while existing or manually added album contents are never removed.
 
+On Immich 3.2 and newer, conditional rules use the structured Search API v2 with cursor pagination. `1 of M` maps to `personIds.any`, `M of M` maps to `personIds.all`, and small intermediate thresholds are expressed as OR branches (for example, `(A+B) OR (A+C) OR (B+C)` for 2 of 3). Large rules avoid exponential request bodies by retaining the bounded per-person counting strategy. Immich 3.1 continues to use the legacy search shape, while Immich 4 is handled entirely through Search API v2.
+
 **Automatic match suggestions are limited to named people.** Unnamed people
 remain available in Manual Matching. Name similarity is the primary signal;
 face embeddings — where the Immich instance still exposes them — add a

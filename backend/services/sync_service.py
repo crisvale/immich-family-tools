@@ -35,6 +35,13 @@ async def _get_qualifying_asset_ids(
     minimum_person_count: int,
 ) -> list[str]:
     """Return assets that occur for at least N distinct selected people."""
+    structured_resolver = getattr(client, "get_assets_matching_people", None)
+    if callable(structured_resolver):
+        assets = await structured_resolver(person_ids, minimum_person_count)
+        return list(dict.fromkeys(asset["id"] for asset in assets))
+
+    # Compatibility path for lightweight clients used by integrations and
+    # tests that only implement the long-standing per-person method.
     counts: Counter[str] = Counter()
     ordered_ids: list[str] = []
     for person_id in person_ids:
