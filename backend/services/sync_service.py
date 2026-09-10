@@ -2,6 +2,7 @@
 import logging
 import uuid
 import asyncio
+from collections import Counter
 from datetime import datetime, timezone
 
 from services.immich_client import ImmichClient, AlbumNotFoundError
@@ -16,6 +17,38 @@ _album_locks: dict[str, asyncio.Lock] = {}
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _person_ids_by_account(person_refs: list[dict]) -> dict[str, list[str]]:
+    """Group distinct selected people by account while preserving input order."""
+    grouped: dict[str, list[str]] = {}
+    for ref in person_refs:
+        person_ids = grouped.setdefault(ref["account_id"], [])
+        if ref["person_id"] not in person_ids:
+            person_ids.append(ref["person_id"])
+    return grouped
+
+
+async def _get_qualifying_asset_ids(
+    client: ImmichClient,
+    person_ids: list[str],
+    minimum_person_count: int,
+) -> list[str]:
+    """Return assets that occur for at least N distinct selected people."""
+    counts: Counter[str] = Counter()
+    ordered_ids: list[str] = []
+    for person_id in person_ids:
+        assets = await client.get_person_assets(person_id)
+        seen_for_person: set[str] = set()
+        for asset in assets:
+            asset_id = asset["id"]
+            if asset_id in seen_for_person:
+                continue
+            seen_for_person.add(asset_id)
+            if asset_id not in counts:
+                ordered_ids.append(asset_id)
+            counts[asset_id] += 1
+    return [asset_id for asset_id in ordered_ids if counts[asset_id] >= minimum_person_count]
 
 
 def _split_add_results(result: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -60,6 +93,18 @@ async def _share_album_if_needed(
     if not accounts_to_share:
         return logs
 
+    # A payload may contain several people from the same account. Share once.
+    unique_accounts: list[Account] = []
+    seen_account_ids: set[str] = set()
+    seen_user_ids: set[str] = set()
+    for account in accounts_to_share:
+        if account.id in seen_account_ids or (account.user_id and account.user_id in seen_user_ids):
+            continue
+        unique_accounts.append(account)
+        seen_account_ids.add(account.id)
+        if account.user_id:
+            seen_user_ids.add(account.user_id)
+
     # Fetch current album members
     try:
         existing_ids = await owner_client.get_album_user_ids(album_id)
@@ -73,8 +118,8 @@ async def _share_album_if_needed(
         return logs
 
     # Only add accounts not already in the album
-    to_add = [a for a in accounts_to_share if a.user_id and a.user_id not in existing_ids]
-    already_there = [a for a in accounts_to_share if a.user_id and a.user_id in existing_ids]
+    to_add = [a for a in unique_accounts if a.user_id and a.user_id not in existing_ids]
+    already_there = [a for a in unique_accounts if a.user_id and a.user_id in existing_ids]
 
     if already_there:
         logger.info("Already in album '%s': %s", album_name, [a.name for a in already_there])
@@ -198,6 +243,9 @@ async def create_shared_album(
     person_refs: list[dict],   # [{"account_id": ..., "person_id": ...}]
     album_name: str,
     store: ConfigStore,
+    minimum_person_count: int = 1,
+    linked_person_ids: Optional[list[str]] = None,
+    condition_person_count: Optional[int] = None,
 ) -> tuple[ManagedAlbum | None, list[SyncLogEntry]]:
     """
     Create a shared album in the owner account, share it with all other
@@ -205,18 +253,27 @@ async def create_shared_album(
     """
     logs: list[SyncLogEntry] = []
     account_map = {a.id: a for a in all_accounts}
+    grouped_person_ids = _person_ids_by_account(person_refs)
 
     # ── 1. Create album in owner account ──────────────────────────────
     owner_client = ImmichClient(owner_account.immich_url, owner_account.api_key)
-    owner_ref = next((r for r in person_refs if r["account_id"] == owner_account.id), None)
-
     initial_asset_ids: list[str] = []
-    if owner_ref:
+    owner_person_ids = grouped_person_ids.get(owner_account.id, [])
+    if owner_person_ids:
         try:
-            assets = await owner_client.get_person_assets(owner_ref["person_id"])
-            initial_asset_ids = [a["id"] for a in assets]
+            initial_asset_ids = await _get_qualifying_asset_ids(
+                owner_client, owner_person_ids, minimum_person_count
+            )
         except Exception as exc:
             logger.warning("Could not load owner assets: %s", exc)
+            if minimum_person_count > 1:
+                return None, [SyncLogEntry(
+                    id=str(uuid.uuid4()), timestamp=_now(), action="create_album",
+                    details=f"Assets für Album '{album_name}' konnten nicht geladen werden",
+                    status="error", error_message="IMMICH_API_ERROR",
+                    message_key="log_album_create_failed",
+                    message_params={"album": album_name},
+                )]
 
     try:
         album = await owner_client.create_album(album_name, initial_asset_ids)
@@ -251,16 +308,17 @@ async def create_shared_album(
     logs.extend(share_logs)
 
     # ── 3. Add each account's assets using their own API key ──────────
-    for ref in person_refs:
-        if ref["account_id"] == owner_account.id:
+    for account_id, person_ids in grouped_person_ids.items():
+        if account_id == owner_account.id:
             continue  # already added in step 1
-        account = account_map.get(ref["account_id"])
+        account = account_map.get(account_id)
         if not account:
             continue
         client = ImmichClient(account.immich_url, account.api_key)
         try:
-            assets = await client.get_person_assets(ref["person_id"])
-            asset_ids = [a["id"] for a in assets]
+            asset_ids = await _get_qualifying_asset_ids(
+                client, person_ids, minimum_person_count
+            )
             if asset_ids:
                 result = await client.add_assets_to_album(album_id, asset_ids)
                 added, failed = _split_add_results(result)
@@ -292,6 +350,13 @@ async def create_shared_album(
         album_name=album_name,
         owner_account_id=owner_account.id,
         person_refs=person_refs,
+        minimum_person_count=minimum_person_count,
+        linked_person_ids=linked_person_ids or [],
+        condition_person_count=(
+            condition_person_count
+            if condition_person_count is not None
+            else len({(ref["account_id"], ref["person_id"]) for ref in person_refs})
+        ),
         created_at=_now(),
         last_synced_at=_now(),
         total_assets=total_assets,
@@ -309,11 +374,15 @@ async def link_existing_album(
     all_accounts: list[Account],
     person_refs: list[dict],
     store: ConfigStore,
+    minimum_person_count: int = 1,
+    linked_person_ids: Optional[list[str]] = None,
+    condition_person_count: Optional[int] = None,
 ) -> tuple[ManagedAlbum | None, list[SyncLogEntry]]:
     """Link an existing Immich album to a match, share it, and fill with assets."""
     logs: list[SyncLogEntry] = []
     account_map = {a.id: a for a in all_accounts}
     owner_client = ImmichClient(owner_account.immich_url, owner_account.api_key)
+    grouped_person_ids = _person_ids_by_account(person_refs)
 
     # Share with accounts not already in the album
     participant_ids = {r["account_id"] for r in person_refs}
@@ -342,14 +411,16 @@ async def link_existing_album(
     total_assets = len(existing_ids)
 
     # Add assets from all accounts
-    for ref in person_refs:
-        account = account_map.get(ref["account_id"])
+    for account_id, person_ids in grouped_person_ids.items():
+        account = account_map.get(account_id)
         if not account:
             continue
         client = ImmichClient(account.immich_url, account.api_key)
         try:
-            assets = await client.get_person_assets(ref["person_id"])
-            new_ids = [a["id"] for a in assets if a["id"] not in existing_ids]
+            qualifying_ids = await _get_qualifying_asset_ids(
+                client, person_ids, minimum_person_count
+            )
+            new_ids = [asset_id for asset_id in qualifying_ids if asset_id not in existing_ids]
             if new_ids:
                 result = await client.add_assets_to_album(album_id, new_ids)
                 added, failed = _split_add_results(result)
@@ -378,7 +449,14 @@ async def link_existing_album(
     managed = ManagedAlbum(
         id=str(uuid.uuid4()), match_id=match_id, album_id=album_id,
         album_name=album_name, owner_account_id=owner_account.id,
-        person_refs=person_refs, created_at=_now(), last_synced_at=_now(),
+        person_refs=person_refs, minimum_person_count=minimum_person_count,
+        linked_person_ids=linked_person_ids or [],
+        condition_person_count=(
+            condition_person_count
+            if condition_person_count is not None
+            else len({(ref["account_id"], ref["person_id"]) for ref in person_refs})
+        ),
+        created_at=_now(), last_synced_at=_now(),
         total_assets=total_assets,
         status="partial" if any(entry.status == "error" for entry in logs) else "active",
     )
@@ -438,14 +516,17 @@ async def _refresh_managed_album_unlocked(
             message_key="log_album_unreachable", message_params={},
         )]
 
-    for ref in managed.person_refs:
-        account = account_map.get(ref["account_id"])
+    grouped_person_ids = _person_ids_by_account(managed.person_refs)
+    for account_id, person_ids in grouped_person_ids.items():
+        account = account_map.get(account_id)
         if not account:
             continue
         client = ImmichClient(account.immich_url, account.api_key)
         try:
-            assets = await client.get_person_assets(ref["person_id"])
-            new_ids = [a["id"] for a in assets if a["id"] not in existing_ids]
+            qualifying_ids = await _get_qualifying_asset_ids(
+                client, person_ids, managed.minimum_person_count
+            )
+            new_ids = [asset_id for asset_id in qualifying_ids if asset_id not in existing_ids]
             if new_ids:
                 result = await client.add_assets_to_album(managed.album_id, new_ids)
                 added, failed = _split_add_results(result)

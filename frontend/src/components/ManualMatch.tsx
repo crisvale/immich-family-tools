@@ -1,6 +1,15 @@
 import { useState, useMemo, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle, XCircle, Plus, Trash2, Play, AlertTriangle, Loader2 } from "lucide-react";
+import {
+  CheckCircle,
+  XCircle,
+  Plus,
+  Trash2,
+  Play,
+  AlertTriangle,
+  Loader2,
+  Link2,
+} from "lucide-react";
 import { api, type Account, type Person, type SyncLogEntry } from "../api/client";
 import { LANG_LOCALES, useT, type ServerErrorLike } from "../i18n";
 
@@ -348,6 +357,11 @@ export default function ManualMatch() {
   const [existingAlbumId, setExistingAlbumId] = useState("");
   const [result, setResult] = useState<SyncLogEntry[] | null>(null);
 
+  const { data: personLinks = [] } = useQuery({
+    queryKey: ["person-links"],
+    queryFn: api.personLinks.list,
+  });
+
   // Default owner to first fully-selected row
   const firstFilledAccountId = selections.find((s) => s.account_id)?.account_id ?? "";
   const effectiveOwner = ownerAccountId || firstFilledAccountId;
@@ -366,7 +380,22 @@ export default function ManualMatch() {
       setResult(data);
       queryClient.invalidateQueries({ queryKey: ["sync-log"] });
       queryClient.invalidateQueries({ queryKey: ["managed-albums"] });
+      queryClient.invalidateQueries({ queryKey: ["person-links"] });
     },
+  });
+
+  const linkMutation = useMutation({
+    mutationFn: () =>
+      api.personLinks.create({
+        display_name: canonicalName.trim() || undefined,
+        persons: selections.map((s) => ({ account_id: s.account_id, person_id: s.person_id })),
+      }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["person-links"] }),
+  });
+
+  const deleteLinkMutation = useMutation({
+    mutationFn: api.personLinks.remove,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["person-links"] }),
   });
 
   const addRow = () => setSelections((prev) => [...prev, { account_id: "", person_id: "" }]);
@@ -384,6 +413,7 @@ export default function ManualMatch() {
     selections.length >= 2 &&
     selections.every((s) => s.account_id && s.person_id) &&
     albumReady;
+  const canLink = selections.length >= 2 && selections.every((s) => s.account_id && s.person_id);
 
   return (
     <div className="p-6 max-w-2xl space-y-6">
@@ -455,18 +485,72 @@ export default function ManualMatch() {
         onExistingAlbumIdChange={setExistingAlbumId}
       />
 
-      {/* Submit */}
-      <button
-        onClick={() => {
-          setResult(null);
-          mutation.mutate();
-        }}
-        disabled={!isValid || mutation.isPending}
-        className="flex items-center gap-2 px-5 py-2.5 bg-immich-primary text-white rounded-lg text-sm font-medium hover:bg-blue-600 disabled:opacity-40 transition-colors"
-      >
-        <Play size={15} />
-        {mutation.isPending ? t("running") : t("run_btn")}
-      </button>
+      {/* Separate actions: linking never renames people or creates an album. */}
+      <div className="flex flex-wrap gap-3">
+        <button
+          onClick={() => {
+            setResult(null);
+            mutation.mutate();
+          }}
+          disabled={!isValid || mutation.isPending}
+          className="flex items-center gap-2 px-5 py-2.5 bg-immich-primary text-white rounded-lg text-sm font-medium hover:bg-blue-600 disabled:opacity-40 transition-colors"
+        >
+          <Play size={15} />
+          {mutation.isPending ? t("running") : t("run_btn")}
+        </button>
+        <button
+          onClick={() => linkMutation.mutate()}
+          disabled={!canLink || linkMutation.isPending}
+          className="btn-ghost flex items-center gap-2 px-5 py-2.5 text-sm disabled:opacity-40"
+        >
+          {linkMutation.isPending ? (
+            <Loader2 size={15} className="animate-spin" />
+          ) : (
+            <Link2 size={15} />
+          )}
+          {t("link_people_action")}
+        </button>
+      </div>
+
+      {linkMutation.isSuccess && (
+        <p className="text-sm text-emerald-400">{t("link_people_success")}</p>
+      )}
+      {linkMutation.isError && (
+        <p className="text-sm text-red-400">{errorText(linkMutation.error as ServerErrorLike)}</p>
+      )}
+
+      {personLinks.length > 0 && (
+        <section className="space-y-2">
+          <h3 className="text-xs text-gray-400 uppercase tracking-wide">
+            {t("linked_identities")}
+          </h3>
+          {personLinks.map((link) => (
+            <div
+              key={link.id}
+              className="flex items-center gap-3 rounded-lg border border-immich-border bg-immich-surface p-3"
+            >
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium truncate">{link.display_name}</p>
+                <p className="text-xs text-gray-500 truncate">
+                  {link.person_refs
+                    .map((ref) => `${ref.person_name || t("unknown")} (${ref.account_name})`)
+                    .join(" · ")}
+                </p>
+              </div>
+              <button
+                className="p-1.5 text-gray-500 hover:text-red-400"
+                aria-label={t("delete_link")}
+                onClick={() => {
+                  if (confirm(t("delete_link_confirm"))) deleteLinkMutation.mutate(link.id);
+                }}
+                disabled={deleteLinkMutation.isPending}
+              >
+                <Trash2 size={15} />
+              </button>
+            </div>
+          ))}
+        </section>
+      )}
 
       {mutation.isError && (
         <p className="text-sm text-red-400">

@@ -240,7 +240,10 @@ export default function ExtendMatch() {
     staleTime: 30_000,
   });
 
-  const groups = useMemo(() => groupAlbums(rawAlbums), [rawAlbums]);
+  const groups = useMemo(
+    () => groupAlbums(rawAlbums.filter((album) => (album.minimum_person_count ?? 1) === 1)),
+    [rawAlbums]
+  );
 
   const [selectedGroupName, setSelectedGroupName] = useState<string | null>(null);
   const [newAccountId, setNewAccountId] = useState("");

@@ -1,7 +1,18 @@
 import React from "react";
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
-import { Loader2, RefreshCw, Trash2, Disc, AlertTriangle, User, Clock, Timer } from "lucide-react";
-import { api, ManagedAlbum, SyncLogEntry } from "../api/client";
+import {
+  Loader2,
+  RefreshCw,
+  Trash2,
+  Disc,
+  AlertTriangle,
+  User,
+  Clock,
+  Timer,
+  Plus,
+  X,
+} from "lucide-react";
+import { api, ManagedAlbum, SyncLogEntry, type Person } from "../api/client";
 import { formatDate, LANG_LOCALES, useT } from "../i18n";
 
 interface AlbumGroup {
@@ -11,12 +22,16 @@ interface AlbumGroup {
   last_synced_at: string | undefined;
   owner_name: string;
   person_refs: ManagedAlbum["person_refs"];
+  minimum_person_count: number;
+  condition_person_count: number;
 }
 
 function groupAlbums(albums: ManagedAlbum[]): AlbumGroup[] {
   const map = new Map<string, ManagedAlbum[]>();
   for (const a of albums) {
-    const key = a.album_name.trim().toLowerCase();
+    const key = a.match_id.startsWith("conditional_")
+      ? `conditional:${a.id}`
+      : a.album_name.trim().toLowerCase();
     if (!map.has(key)) map.set(key, []);
     map.get(key)!.push(a);
   }
@@ -49,8 +64,302 @@ function groupAlbums(albums: ManagedAlbum[]): AlbumGroup[] {
       last_synced_at: lastSync,
       owner_name: ownerRef?.account_name ?? first.owner_account_id,
       person_refs: personRefs,
+      minimum_person_count: first.minimum_person_count ?? 1,
+      condition_person_count: first.condition_person_count ?? personRefs.length,
     };
   });
+}
+
+function ConditionalAlbumBuilder({ onClose }: { onClose: () => void }) {
+  const { t } = useT();
+  const qc = useQueryClient();
+  const [ownerAccountId, setOwnerAccountId] = React.useState("");
+  const [albumMode, setAlbumMode] = React.useState<"new" | "existing">("new");
+  const [albumName, setAlbumName] = React.useState("");
+  const [existingAlbumId, setExistingAlbumId] = React.useState("");
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+  const [selectedLinkIds, setSelectedLinkIds] = React.useState<Set<string>>(new Set());
+  const [minimumCount, setMinimumCount] = React.useState(2);
+  const [logs, setLogs] = React.useState<SyncLogEntry[] | null>(null);
+
+  const { data: accounts = [], isLoading: loadingAccounts } = useQuery({
+    queryKey: ["accounts"],
+    queryFn: api.accounts.list,
+    staleTime: 60_000,
+  });
+  const { data: people = [], isFetching: loadingPeople } = useQuery({
+    queryKey: ["people", ownerAccountId],
+    queryFn: () => api.people.byAccount(ownerAccountId),
+    enabled: !!ownerAccountId,
+    staleTime: 60_000,
+  });
+  const { data: personLinks = [] } = useQuery({
+    queryKey: ["person-links"],
+    queryFn: api.personLinks.list,
+    staleTime: 30_000,
+  });
+  const { data: existingAlbums = [], isFetching: loadingAlbums } = useQuery({
+    queryKey: ["account-albums", ownerAccountId],
+    queryFn: () => api.accounts.albums(ownerAccountId),
+    enabled: !!ownerAccountId && albumMode === "existing",
+  });
+
+  const identityCount = selectedIds.size + selectedLinkIds.size;
+  const coveredOwnerPersonIds = React.useMemo(() => {
+    const ids = new Set<string>();
+    for (const link of personLinks) {
+      if (!selectedLinkIds.has(link.id)) continue;
+      for (const ref of link.person_refs) {
+        if (ref.account_id === ownerAccountId) ids.add(ref.person_id);
+      }
+    }
+    return ids;
+  }, [personLinks, selectedLinkIds, ownerAccountId]);
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      api.sync.conditionalAlbum({
+        ...(albumMode === "new"
+          ? { album_name: albumName.trim() }
+          : { existing_album_id: existingAlbumId }),
+        owner_account_id: ownerAccountId,
+        persons: Array.from(selectedIds).map((person_id) => ({
+          account_id: ownerAccountId,
+          person_id,
+        })),
+        linked_person_ids: Array.from(selectedLinkIds),
+        minimum_person_count: minimumCount,
+      }),
+    onSuccess: (result) => {
+      setLogs(result);
+      setAlbumName("");
+      setSelectedIds(new Set());
+      setSelectedLinkIds(new Set());
+      setExistingAlbumId("");
+      setMinimumCount(2);
+      qc.invalidateQueries({ queryKey: ["managed-albums"] });
+      qc.invalidateQueries({ queryKey: ["sync-log"] });
+    },
+  });
+
+  const chooseOwner = (accountId: string) => {
+    setOwnerAccountId(accountId);
+    setSelectedIds(new Set());
+    setSelectedLinkIds(new Set());
+    setExistingAlbumId("");
+    setMinimumCount(2);
+    setLogs(null);
+    mutation.reset();
+  };
+  const togglePerson = (person: Person) => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(person.id)) next.delete(person.id);
+      else next.add(person.id);
+      setMinimumCount((count) => Math.min(Math.max(1, count), Math.max(1, next.size)));
+      return next;
+    });
+  };
+  const toggleLink = (id: string) => {
+    setSelectedLinkIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      const link = personLinks.find((candidate) => candidate.id === id);
+      if (link && !current.has(id)) {
+        setSelectedIds((selected) => {
+          const clean = new Set(selected);
+          for (const ref of link.person_refs) {
+            if (ref.account_id === ownerAccountId) clean.delete(ref.person_id);
+          }
+          return clean;
+        });
+      }
+      return next;
+    });
+  };
+  const canCreate =
+    (albumMode === "new" ? albumName.trim().length > 0 : existingAlbumId.length > 0) &&
+    ownerAccountId.length > 0 &&
+    identityCount >= 2 &&
+    minimumCount >= 1 &&
+    minimumCount <= identityCount;
+
+  React.useEffect(() => {
+    setMinimumCount((count) => Math.min(Math.max(1, count), Math.max(1, identityCount)));
+  }, [identityCount]);
+
+  return (
+    <div className="card mb-6 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="font-semibold">{t("conditional_album_title")}</h2>
+          <p className="text-xs text-gray-500 mt-1">{t("conditional_album_hint")}</p>
+        </div>
+        <button
+          className="btn-ghost p-1.5"
+          onClick={onClose}
+          aria-label={t("conditional_album_close")}
+        >
+          <X size={16} />
+        </button>
+      </div>
+
+      <div className="grid sm:grid-cols-2 gap-3">
+        <label className="space-y-1">
+          <span className="text-xs text-gray-500">{t("conditional_album_owner")}</span>
+          <select
+            className="input text-sm"
+            value={ownerAccountId}
+            onChange={(e) => chooseOwner(e.target.value)}
+            disabled={loadingAccounts || mutation.isPending}
+          >
+            <option value="">{t("account_select_ph")}</option>
+            {accounts.map((account) => (
+              <option key={account.id} value={account.id}>
+                {account.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="space-y-2">
+          <div className="flex gap-1 rounded-lg bg-immich-bg p-1">
+            {(["new", "existing"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => setAlbumMode(mode)}
+                className={`flex-1 rounded px-2 py-1 text-xs ${albumMode === mode ? "bg-immich-primary text-white" : "text-gray-400"}`}
+              >
+                {t(mode === "new" ? "album_new" : "album_link_existing")}
+              </button>
+            ))}
+          </div>
+          {albumMode === "new" ? (
+            <input
+              className="input text-sm"
+              aria-label={t("album_name_label")}
+              value={albumName}
+              onChange={(e) => setAlbumName(e.target.value)}
+              placeholder={t("conditional_album_name_ph")}
+              disabled={mutation.isPending}
+            />
+          ) : (
+            <select
+              className="input text-sm"
+              aria-label={t("album_link_existing")}
+              value={existingAlbumId}
+              onChange={(e) => setExistingAlbumId(e.target.value)}
+              disabled={!ownerAccountId || loadingAlbums || mutation.isPending}
+            >
+              <option value="">{loadingAlbums ? t("loading") : t("album_select_ph")}</option>
+              {existingAlbums.map((album) => (
+                <option key={album.id} value={album.id}>
+                  {album.name}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      </div>
+
+      {personLinks.length > 0 && (
+        <div className="space-y-2">
+          <p className="text-xs text-gray-500 font-medium">{t("linked_identities")}</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {personLinks.map((link) => {
+              const selected = selectedLinkIds.has(link.id);
+              return (
+                <button
+                  key={link.id}
+                  type="button"
+                  onClick={() => toggleLink(link.id)}
+                  className={`rounded-lg border p-2 text-left ${selected ? "border-immich-primary bg-blue-900/20" : "border-immich-border"}`}
+                >
+                  <span className="block text-sm font-medium">{link.display_name}</span>
+                  <span className="block text-xs text-gray-500 truncate">
+                    {link.person_refs.map((ref) => ref.account_name).join(" · ")}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {ownerAccountId && (
+        <div className="space-y-2">
+          <p className="text-xs text-gray-500 font-medium">
+            {t("conditional_album_people", identityCount)}
+          </p>
+          {loadingPeople ? (
+            <div className="flex items-center gap-2 py-4 text-sm text-gray-500">
+              <Loader2 size={14} className="animate-spin" />
+              {t("loading")}
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-72 overflow-y-auto pr-1">
+              {people.map((person) => {
+                const selected = selectedIds.has(person.id);
+                const covered = coveredOwnerPersonIds.has(person.id);
+                return (
+                  <button
+                    key={person.id}
+                    type="button"
+                    onClick={() => togglePerson(person)}
+                    disabled={mutation.isPending || covered}
+                    title={covered ? t("person_covered_by_link") : undefined}
+                    className={`flex items-center gap-2 rounded-lg border p-2 text-left transition-colors ${covered ? "opacity-40" : selected ? "border-immich-primary bg-blue-900/20" : "border-immich-border hover:border-gray-500"}`}
+                  >
+                    <img
+                      src={api.people.thumbnailUrl(person.account_id, person.id)}
+                      alt=""
+                      className="w-9 h-9 rounded-full object-cover bg-immich-border shrink-0"
+                      onError={(e) => {
+                        (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
+                      }}
+                    />
+                    <span className="text-sm truncate">{person.name || t("unknown")}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {identityCount >= 2 && (
+        <label className="space-y-1 block">
+          <span className="text-xs text-gray-500">{t("conditional_album_minimum")}</span>
+          <div className="flex items-center gap-3">
+            <input
+              type="range"
+              min={1}
+              max={identityCount}
+              value={minimumCount}
+              onChange={(e) => setMinimumCount(Number(e.target.value))}
+              className="flex-1 accent-immich-primary"
+              disabled={mutation.isPending}
+            />
+            <span className="text-sm font-medium min-w-24 text-right">
+              {t("conditional_album_rule", minimumCount, identityCount)}
+            </span>
+          </div>
+        </label>
+      )}
+
+      {mutation.error && <p className="text-xs text-red-400">{mutation.error.message}</p>}
+      <SyncLogDisplay logs={logs} syncing={mutation.isPending} />
+      <button
+        className="btn-primary text-sm flex items-center gap-1.5"
+        onClick={() => mutation.mutate()}
+        disabled={!canCreate || mutation.isPending}
+      >
+        {mutation.isPending ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+        {t("conditional_album_create")}
+      </button>
+    </div>
+  );
 }
 
 function SyncLogDisplay({ logs, syncing }: { logs: SyncLogEntry[] | null; syncing: boolean }) {
@@ -149,6 +458,11 @@ function AlbumGroupCard({
 
       <div className="space-y-1.5">
         <p className="text-xs text-gray-500 font-medium">{t("linked_people")}</p>
+        {group.minimum_person_count > 1 && (
+          <p className="text-xs text-blue-300">
+            {t("conditional_album_rule", group.minimum_person_count, group.condition_person_count)}
+          </p>
+        )}
         {group.person_refs.map((ref, i) => (
           <div key={i} className="flex items-center gap-2">
             <User size={12} className="text-gray-600 shrink-0" />
@@ -284,6 +598,7 @@ export default function AlbumsOverview() {
     new Map()
   );
   const [refreshingAll, setRefreshingAll] = React.useState(false);
+  const [showBuilder, setShowBuilder] = React.useState(false);
 
   const handleRefreshAll = async () => {
     setRefreshingAll(true);
@@ -313,21 +628,32 @@ export default function AlbumsOverview() {
           <h1 className="text-xl font-bold">{t("albums_title")}</h1>
           <p className="text-sm text-gray-500 mt-0.5">{t("albums_subtitle", groups.length)}</p>
         </div>
-        {groups.length > 0 && (
+        <div className="flex items-center gap-2">
           <button
             className="btn-primary text-sm flex items-center gap-1.5"
-            onClick={handleRefreshAll}
-            disabled={refreshingAll}
+            onClick={() => setShowBuilder((show) => !show)}
           >
-            {refreshingAll ? (
-              <Loader2 size={14} className="animate-spin" />
-            ) : (
-              <RefreshCw size={14} />
-            )}
-            {t("sync_all")}
+            {showBuilder ? <X size={14} /> : <Plus size={14} />}
+            {t("conditional_album_new")}
           </button>
-        )}
+          {groups.length > 0 && (
+            <button
+              className="btn-primary text-sm flex items-center gap-1.5"
+              onClick={handleRefreshAll}
+              disabled={refreshingAll}
+            >
+              {refreshingAll ? (
+                <Loader2 size={14} className="animate-spin" />
+              ) : (
+                <RefreshCw size={14} />
+              )}
+              {t("sync_all")}
+            </button>
+          )}
+        </div>
       </div>
+
+      {showBuilder && <ConditionalAlbumBuilder onClose={() => setShowBuilder(false)} />}
 
       {/* Auto-sync control */}
       <div className="mb-6">

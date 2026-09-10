@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from itertools import combinations
 from pathlib import Path
@@ -16,13 +17,13 @@ from typing import Optional
 from pydantic import ValidationError
 
 from models.account import Account, AccountCreate
-from models.match import ManagedAlbum, SyncLogEntry
+from models.match import LinkedPerson, ManagedAlbum, MultiSyncPersonEntry, PersonRef, SyncLogEntry
 
 logger = logging.getLogger(__name__)
 
 
 class ConfigStore:
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: str, log_retention_days: int = 90):
         self._path = Path(path)
@@ -33,6 +34,7 @@ class ConfigStore:
             "dismissed_match_ids": [],
             "sync_log": [],
             "managed_albums": [],
+            "linked_people": [],
         }
         self._load()
 
@@ -59,6 +61,36 @@ class ConfigStore:
             for a, b in combinations(ids, 2)
         ]
 
+    def _album_linked_match_ids(self, album: ManagedAlbum | dict) -> list[str]:
+        """Return identity-match IDs without pairing unrelated conditional subjects."""
+        raw = album.model_dump() if hasattr(album, "model_dump") else album
+        if not str(raw.get("match_id", "")).startswith("conditional_"):
+            return self.compute_linked_match_ids(raw.get("person_refs", []))
+
+        album_keys = {
+            (ref.get("account_id"), ref.get("person_id"))
+            for ref in raw.get("person_refs", [])
+        }
+        match_ids: list[str] = []
+        for linked_id in raw.get("linked_person_ids", []):
+            linked = next(
+                (
+                    item
+                    for item in self._data.get("linked_people", [])
+                    if item.get("id") == linked_id
+                ),
+                None,
+            )
+            if not linked:
+                continue
+            refs = [
+                ref
+                for ref in linked.get("person_refs", [])
+                if (ref.get("account_id"), ref.get("person_id")) in album_keys
+            ]
+            match_ids.extend(self.compute_linked_match_ids(refs))
+        return list(dict.fromkeys(match_ids))
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
@@ -70,6 +102,7 @@ class ConfigStore:
                 if not isinstance(self._data, dict) or not isinstance(self._data.get("accounts", {}), dict):
                     raise ValueError("invalid configuration schema")
                 self._data.setdefault("managed_albums", [])
+                self._data.setdefault("linked_people", [])
                 logger.info("Config loaded from %s", self._path)
                 self._migrate()
             except Exception as exc:
@@ -91,6 +124,7 @@ class ConfigStore:
         self._data.setdefault("synced_name_match_ids", [])
         self._data.setdefault("sync_log", [])
         self._data.setdefault("auto_sync", {"enabled": False, "time": "01:00"})
+        self._data.setdefault("linked_people", [])
 
         for album in albums:
             album_name = album.get("album_name", "")
@@ -111,9 +145,18 @@ class ConfigStore:
                     changed = True
 
             # Recompute linked_match_ids — always authoritative
-            computed = self.compute_linked_match_ids(album.get("person_refs", []))
+            computed = self._album_linked_match_ids(album)
             if set(album.get("linked_match_ids", [])) != set(computed):
                 album["linked_match_ids"] = computed
+                changed = True
+            if "linked_person_ids" not in album:
+                album["linked_person_ids"] = []
+                changed = True
+            if not album.get("condition_person_count"):
+                album["condition_person_count"] = len({
+                    (ref.get("account_id"), ref.get("person_id"))
+                    for ref in album.get("person_refs", [])
+                })
                 changed = True
 
         if changed:
@@ -181,9 +224,18 @@ class ConfigStore:
                 if ref.get("account_id") != account_id
             ]
             if len(album["person_refs"]) >= 2:
-                album["linked_match_ids"] = self.compute_linked_match_ids(album["person_refs"])
+                album["linked_match_ids"] = self._album_linked_match_ids(album)
                 cleaned_albums.append(album)
         self._data["managed_albums"] = cleaned_albums
+        retained_links = []
+        for link in self._data.get("linked_people", []):
+            link["person_refs"] = [
+                ref for ref in link.get("person_refs", [])
+                if ref.get("account_id") != account_id
+            ]
+            if len({ref.get("account_id") for ref in link["person_refs"]}) >= 2:
+                retained_links.append(link)
+        self._data["linked_people"] = retained_links
         self._data["dismissed_match_ids"] = []
         self._data["synced_name_match_ids"] = []
         self._data["sync_log"] = [
@@ -191,6 +243,97 @@ class ConfigStore:
             if (entry.get("undo_data") or {}).get("account_id") != account_id
             and (not account_name or account_name not in entry.get("details", ""))
         ]
+        self._save()
+        return True
+
+    # ------------------------------------------------------------------
+    # Linked people
+    # ------------------------------------------------------------------
+
+    def get_linked_people(self) -> list[LinkedPerson]:
+        return [LinkedPerson(**item) for item in self._data.get("linked_people", [])]
+
+    def get_linked_person(self, linked_person_id: str) -> Optional[LinkedPerson]:
+        return next((item for item in self.get_linked_people() if item.id == linked_person_id), None)
+
+    def ensure_linked_person(
+        self,
+        display_name: str,
+        person_refs: list[MultiSyncPersonEntry | dict],
+    ) -> LinkedPerson:
+        """Create, reuse, or compatibly extend a cross-account identity."""
+        normalized: list[PersonRef] = []
+        for raw in person_refs:
+            payload = raw.model_dump() if hasattr(raw, "model_dump") else dict(raw)
+            account = self.get_account(payload["account_id"])
+            normalized.append(PersonRef(
+                account_id=payload["account_id"],
+                person_id=payload["person_id"],
+                person_name=payload.get("person_name") or display_name,
+                account_name=payload.get("account_name") or (account.name if account else ""),
+                account_color=payload.get("account_color") or (account.color if account else "#6366f1"),
+            ))
+        keys = {(ref.account_id, ref.person_id) for ref in normalized}
+        links = self.get_linked_people()
+        overlapping = [
+            link for link in links
+            if keys & {(ref.account_id, ref.person_id) for ref in link.person_refs}
+        ]
+        if len(overlapping) > 1:
+            raise ValueError("profiles belong to incompatible linked people")
+
+        if overlapping:
+            link = overlapping[0]
+            merged = list(link.person_refs)
+            by_account = {ref.account_id: ref.person_id for ref in merged}
+            existing_keys = {(ref.account_id, ref.person_id) for ref in merged}
+            changed = False
+            normalized_name = display_name.strip()
+            if normalized_name and normalized_name != link.display_name:
+                link.display_name = normalized_name
+                changed = True
+            for ref in normalized:
+                current = by_account.get(ref.account_id)
+                if current is not None and current != ref.person_id:
+                    raise ValueError("linked person already has another profile for this account")
+                if (ref.account_id, ref.person_id) not in existing_keys:
+                    merged.append(ref)
+                    existing_keys.add((ref.account_id, ref.person_id))
+                    by_account[ref.account_id] = ref.person_id
+                    changed = True
+            if changed:
+                link.person_refs = merged
+                self.update_linked_person(link)
+            return link
+
+        if len({ref.account_id for ref in normalized}) < 2:
+            raise ValueError("linked people require profiles from at least two accounts")
+        if len({ref.account_id for ref in normalized}) != len(normalized):
+            raise ValueError("linked people allow one profile per account")
+        linked = LinkedPerson(
+            id=str(uuid.uuid4()),
+            display_name=display_name,
+            person_refs=normalized,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self._data.setdefault("linked_people", []).append(linked.model_dump())
+        self._save()
+        return linked
+
+    def update_linked_person(self, linked: LinkedPerson) -> None:
+        items = self._data.setdefault("linked_people", [])
+        for index, item in enumerate(items):
+            if item.get("id") == linked.id:
+                items[index] = linked.model_dump()
+                self._save()
+                return
+
+    def delete_linked_person(self, linked_person_id: str) -> bool:
+        items = self._data.get("linked_people", [])
+        retained = [item for item in items if item.get("id") != linked_person_id]
+        if len(retained) == len(items):
+            return False
+        self._data["linked_people"] = retained
         self._save()
         return True
 
@@ -366,14 +509,14 @@ class ConfigStore:
 
     def add_managed_album(self, album: ManagedAlbum) -> None:
         # Always compute linked_match_ids before saving
-        album.linked_match_ids = self.compute_linked_match_ids(album.person_refs)
+        album.linked_match_ids = self._album_linked_match_ids(album)
         albums = self._data.setdefault("managed_albums", [])
         albums.append(album.model_dump())
         self._save()
 
     def update_managed_album(self, album: ManagedAlbum) -> None:
         # Always recompute linked_match_ids before saving
-        album.linked_match_ids = self.compute_linked_match_ids(album.person_refs)
+        album.linked_match_ids = self._album_linked_match_ids(album)
         albums = self._data.get("managed_albums", [])
         for i, a in enumerate(albums):
             if a["id"] == album.id:

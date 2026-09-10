@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useQueries } from "@tanstack/react-query";
-import { Loader2, Search, UserX, User } from "lucide-react";
-import { api, Person } from "../api/client";
+import { Loader2, Search, UserX, User, Link2, Images } from "lucide-react";
+import { api, LinkedPerson, Person } from "../api/client";
 import { LANG_LOCALES, useT } from "../i18n";
 
 function PersonCard({ person }: { person: Person }) {
@@ -48,6 +48,111 @@ function PersonCard({ person }: { person: Person }) {
   );
 }
 
+function personKey(accountId: string, personId: string): string {
+  return `${accountId}:${personId}`;
+}
+
+export function linkedDisplayNames(link: LinkedPerson, people: Person[]): string[] {
+  const peopleByKey = new Map(
+    people.map((person) => [personKey(person.account_id, person.id), person])
+  );
+  return Array.from(
+    new Set(
+      link.person_refs
+        .map(
+          (ref) =>
+            peopleByKey.get(personKey(ref.account_id, ref.person_id))?.name ?? ref.person_name
+        )
+        .filter((name): name is string => Boolean(name))
+    )
+  );
+}
+
+function LinkedPersonCard({ link, people }: { link: LinkedPerson; people: Person[] }) {
+  const { t, lang } = useT();
+  const peopleByKey = new Map(
+    people.map((person) => [personKey(person.account_id, person.id), person])
+  );
+  const profiles = link.person_refs.map((ref) => ({
+    ref,
+    person: peopleByKey.get(personKey(ref.account_id, ref.person_id)),
+  }));
+  const countQueries = useQueries({
+    queries: profiles.map(({ ref, person }) => ({
+      queryKey: ["person-count", ref.account_id, ref.person_id],
+      queryFn: () => api.people.count(ref.account_id, ref.person_id),
+      enabled: !person || person.asset_count === 0,
+      staleTime: 5 * 60_000,
+    })),
+  });
+  const names = linkedDisplayNames(link, people);
+  const totalPhotos = profiles.reduce((total, { person }, index) => {
+    const count =
+      person?.asset_count && person.asset_count > 0
+        ? person.asset_count
+        : (countQueries[index]?.data?.count ?? 0);
+    return total + count;
+  }, 0);
+  const countsLoading = countQueries.some((query) => query.isFetching);
+
+  return (
+    <article className="card p-4 space-y-3 border-violet-900/60">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <Link2 size={15} className="text-violet-300 shrink-0" />
+            <h3 className="font-semibold truncate">
+              {names.length > 0 ? names.join(" · ") : link.display_name}
+            </h3>
+          </div>
+          {names.length > 1 && (
+            <p className="text-xs text-gray-500 mt-1">{t("linked_different_names")}</p>
+          )}
+        </div>
+        <div className="flex items-center gap-1 text-sm text-gray-300 shrink-0">
+          <Images size={14} />
+          {t(
+            "linked_photo_total",
+            countsLoading ? "…" : totalPhotos.toLocaleString(LANG_LOCALES[lang])
+          )}
+        </div>
+      </div>
+
+      <div className="flex flex-wrap gap-3">
+        {profiles.map(({ ref, person }) => (
+          <div
+            key={personKey(ref.account_id, ref.person_id)}
+            className="flex items-center gap-2 min-w-0"
+          >
+            <div className="w-11 h-11 rounded-full overflow-hidden bg-immich-border shrink-0">
+              <img
+                src={api.people.thumbnailUrl(ref.account_id, ref.person_id)}
+                alt={person?.name || ref.person_name || t("unknown")}
+                className="w-full h-full object-cover"
+                onError={(event) => {
+                  event.currentTarget.style.visibility = "hidden";
+                }}
+              />
+            </div>
+            <div className="min-w-0">
+              <p className="text-xs truncate max-w-36">
+                {person?.name || ref.person_name || t("unknown")}
+              </p>
+              <span
+                className="badge text-xs inline-block mt-0.5"
+                style={{ backgroundColor: person?.account_color || ref.account_color }}
+              >
+                {person?.account_name || ref.account_name}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+      <p className="text-xs text-gray-500">{t("linked_profile_count", profiles.length)}</p>
+    </article>
+  );
+}
+
 type Filter = "all" | "named" | "unnamed";
 
 export default function PeopleGrid() {
@@ -87,6 +192,25 @@ export default function PeopleGrid() {
 
   const namedCount = people.filter((p) => p.name).length;
   const unnamedCount = people.filter((p) => !p.name).length;
+  const { data: linkedPeople = [] } = useQuery({
+    queryKey: ["person-links"],
+    queryFn: api.personLinks.list,
+    staleTime: 30_000,
+  });
+  const filteredLinkedPeople = linkedPeople.filter((link) => {
+    const names = linkedDisplayNames(link, people);
+    if (filter === "named" && names.length === 0) return false;
+    if (filter === "unnamed" && names.length > 0) return false;
+    if (search) {
+      const query = search.toLowerCase();
+      if (
+        !link.display_name.toLowerCase().includes(query) &&
+        !names.some((name) => name.toLowerCase().includes(query))
+      )
+        return false;
+    }
+    return true;
+  });
 
   return (
     <div className="p-6">
@@ -144,6 +268,25 @@ export default function PeopleGrid() {
           </button>
         ))}
       </div>
+
+      {filteredLinkedPeople.length > 0 && (
+        <section className="mb-6 space-y-3">
+          <div>
+            <h2 className="text-sm font-semibold flex items-center gap-2">
+              <Link2 size={15} className="text-violet-300" />
+              {t("linked_people_title")}
+            </h2>
+            <p className="text-xs text-gray-500 mt-1">
+              {t("linked_people_subtitle", filteredLinkedPeople.length)}
+            </p>
+          </div>
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+            {filteredLinkedPeople.map((link) => (
+              <LinkedPersonCard key={link.id} link={link} people={people} />
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* Show spinner only if nothing loaded yet */}
       {loadingAccounts || (anyLoading && people.length === 0) ? (
