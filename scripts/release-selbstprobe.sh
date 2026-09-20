@@ -156,15 +156,86 @@ GH_GIBT_ES_NICHT=gh-existiert-hier-nicht
 # Fixture-Variable $Z ab dem ersten Aufruf auf das ZULETZT gepruefte Repo.
 # Abschnitt 11 hat dadurch das absichtlich rote Fixture getaggt und den
 # Fehlschlag dem Skript angelastet. Die Huelle war der Defekt, nicht das Gate.
+# Der Exit-Code reist IN der Ausgabe mit, als letzte Zeile.
+#
+# Die erste Fassung legte ihn in eine Datei — "letzter Status". Das ist ein
+# SEITENKANAL: Ein Fall, der seine Ausgabe zwischenspeichert und spaeter prueft,
+# wurde gegen den Status eines FREMDEN Laufs beurteilt. Gemessen vom
+# Fremdpruefer: eine gespeicherte Ausgabe eines faelschlich erfolgreichen
+# `bump` bestand, weil danach ein anderer, roter Lauf die Datei beschrieben
+# hatte.
+#
+# Jetzt sind Ausgabe und Status untrennbar. `lauf_status` zeigte diese Form
+# schon; sie gilt ab hier ueberall.
+STATUSMARKE="__GATE_EXIT__="
+
 lauf() {
   ZL=$1; shift
-  (cd "$ZL" && PATH="$STUBS:$PATH" sh scripts/release.sh "$@" 2>&1) || true
+  RC=0
+  AUS=$( cd "$ZL" && PATH="$STUBS:$PATH" sh scripts/release.sh "$@" 2>&1 ) || RC=$?
+  printf '%s\n%s%s\n' "$AUS" "$STATUSMARKE" "$RC"
+}
+
+# Liest den Status aus einer Ausgabe, die `lauf` erzeugt hat.
+status_aus() {
+  echo "$1" | sed -n "s/^$STATUSMARKE//p" | tail -n 1
+}
+
+# lauf_status <verzeichnis> [argumente...] -> druckt NUR den Exit-Code.
+#
+# `lauf` wirft den Status per `|| true` weg, weil die meisten Faelle den TEXT
+# pruefen. Genau daran ist die Probe fast gescheitert: Eine Ein-Zeichen-Mutation
+# (`return 1` -> `return 0` im Abbruch) liess das Gate "Gate ROT ... Kein Tag."
+# drucken UND danach taggen, mit Exit 0 — und die Selbstprobe meldete
+# unveraendert alles gruen, weil keiner ihrer Faelle je einen Status ansah.
+# Ein Gate wird nicht am Text abgefragt, sondern am Exit-Code.
+lauf_status() {
+  ZL=$1; shift
+  # `|| RC=$?` statt `echo $?` danach: Unter `set -e` beendet ein
+  # fehlschlagender Subshell-Aufruf die Funktion, BEVOR sie ihren Status
+  # ausgeben kann — und ausgerechnet der Fehlerfall ist der, den diese
+  # Faelle messen wollen. Dritter Auftritt derselben Falle in einer Sitzung;
+  # sie sieht jedes Mal anders aus und ist jedes Mal dieselbe.
+  #
+  # Ausgabe: "<exit> <ausgabe in einer Zeile>". Die Ausgabe gehoert dazu,
+  # weil "nicht 0" allein zwei voellig verschiedene Dinge bedeuten kann —
+  # "das Gate hat abgelehnt" und "das Skript ist nie gelaufen". Die erste
+  # Fassung warf sie nach /dev/null; vier der fuenf neuen Faelle konnten
+  # danach ein syntaktisch totes release.sh nicht von einem arbeitenden
+  # unterscheiden (Blindpruefer 20.09.2026).
+  RC=0
+  AUS=$( cd "$ZL" && PATH="$STUBS:$PATH" sh scripts/release.sh "$@" 2>&1 ) || RC=$?
+  echo "$RC $(echo "$AUS" | tr '
+' '|')"
+}
+
+# Trennt die beiden Bedeutungen von "nicht 0": Das Gate muss abgelehnt HABEN,
+# nicht bloss irgendwie gestorben sein.
+gate_hat_abgelehnt() {
+  # Exit 1 ist die Ablehnung des Gates. Alles andere ist etwas anderes:
+  # 2 = Aufruffehler, 127 = Kommando nicht gefunden, 2 aus der Shell =
+  # Syntaxfehler. Die erste Fassung fragte nur "nicht 0" und hielt damit einen
+  # ABSTURZ fuer eine kontrollierte Ablehnung — belegt mit der Mutation
+  # `return 1` -> `kommando-das-es-nicht-gibt` (Exit 127), die unbemerkt blieb
+  # (Fremdpruefer 20.09.2026).
+  case "$1" in
+    "1 "*) ;;
+    *) return 1 ;;
+  esac
+  # Und die Ablehnung muss vom GATE stammen, nicht aus dem Nichts.
+  case "$1" in
+    *"Gate ROT"*) return 0 ;;
+    *"FEHLER"*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # lauf_ohne_gh <verzeichnis> [argumente...]
 lauf_ohne_gh() {
   ZL=$1; shift
-  (cd "$ZL" && RELEASE_GH="$GH_GIBT_ES_NICHT" sh scripts/release.sh "$@" 2>&1) || true
+  RC=0
+  AUS=$( cd "$ZL" && RELEASE_GH="$GH_GIBT_ES_NICHT" sh scripts/release.sh "$@" 2>&1 ) || RC=$?
+  printf '%s\n%s%s\n' "$AUS" "$STATUSMARKE" "$RC"
 }
 
 # erwarte <beschreibung> <OK|FEHLER> <teilstring> <ausgabe>
@@ -189,7 +260,53 @@ treffer() {
 }
 erwarte() {
   BESCHREIBUNG=$1; ART=$2; TEIL=$3; AUSGABE=$4
-  if echo "$AUSGABE" | treffer "$ART" "$TEIL"; then
+
+  # DER HEBEL DIESES SLICES. Eine gemeldete FEHLER-Zeile ist nur dann ein
+  # Befund, wenn das Gate deswegen auch rot ZURUECKKOMMT. Genau diese Luecke
+  # war der BLOCKER aus #80: Eine Mutation `rot` -> `echo` liess das Gate
+  # "FEHLER ... Das ist ROT" drucken UND danach "Gate gruen" mit Exit 0 — und
+  # die Probe meldete unveraendert alles gruen, weil kein Fall den Status ansah.
+  #
+  # Die Pruefung haengt hier am Helfer, nicht an jedem einzelnen Fall: So gilt
+  # sie fuer jeden bestehenden, ohne dass ihn jemand anfassen muss. Wie viele
+  # das sind, steht hier bewusst nicht — die Zahl waechst mit jedem Fund
+  # (lehren.md Paragraph 9); `grep -c 'erwarte '` sagt es jederzeit.
+  if [ "$ART" = "FEHLER" ]; then
+    # Der Status kommt aus DIESER Ausgabe, nicht aus einer Datei daneben. Eine
+    # zwischengespeicherte Ausgabe bringt damit ihren eigenen Status mit.
+    LETZTER=$(status_aus "$AUSGABE")
+    [ -n "$LETZTER" ] || LETZTER="fehlt"
+    # Exit 1 ist die Ablehnung des Gates. 127 (Kommando nicht gefunden) und 2
+    # (Aufruf- oder Syntaxfehler) sind ABSTUERZE. Die erste Fassung fragte nur
+    # "nicht 0" — und liess damit ein Gate durch, das NACH der FEHLER-Zeile
+    # abstuerzte, `pruefe_ci` nie erreichte und dem Owner eine Shell-Meldung
+    # hinterliess. Dieselbe Unterscheidung steht seit demselben Commit in
+    # `gate_hat_abgelehnt`; sie fehlte ausgerechnet hier, wo sie die Mehrzahl
+    # der Faelle traegt.
+    if [ "$LETZTER" != "0" ] && [ "$LETZTER" != "1" ] && [ "$LETZTER" != "fehlt" ]; then
+      printf '  FEHLGESCHLAGEN  %s\n' "$BESCHREIBUNG"
+      printf '      das Gate kam mit %s zurueck — ein Absturz, keine Ablehnung\n' "$LETZTER"
+      echo "$AUSGABE" | sed 's/^/      | /'
+      ROT=$((ROT + 1))
+      return
+    fi
+    if [ "$LETZTER" = "0" ]; then
+      printf '  FEHLGESCHLAGEN  %s\n' "$BESCHREIBUNG"
+      printf '      die Meldung steht da, aber das Gate kam mit 0 zurueck —\n'
+      printf '      eine Meldung ohne Wirkung ist kein Befund\n'
+      echo "$AUSGABE" | sed 's/^/      | /'
+      ROT=$((ROT + 1))
+      return
+    fi
+    if [ "$LETZTER" = "fehlt" ]; then
+      printf '  FEHLGESCHLAGEN  %s\n' "$BESCHREIBUNG"
+      printf '      kein Status vom letzten Lauf — die Wirkung ist unbelegt\n'
+      ROT=$((ROT + 1))
+      return
+    fi
+  fi
+
+  if echo "$AUSGABE" | grep -v "^$STATUSMARKE" | treffer "$ART" "$TEIL"; then
     printf '  bestanden   %s\n' "$BESCHREIBUNG"
     GRUEN=$((GRUEN + 1))
   else
@@ -216,6 +333,118 @@ erwarte "1.5 wird abgelehnt"      FEHLER "kein MAJOR.MINOR.PATCH" "$(lauf "$Z" p
 erwarte "1.5.0.1 wird abgelehnt"  FEHLER "kein MAJOR.MINOR.PATCH" "$(lauf "$Z" pruefen 1.5.0.1)"
 erwarte "1.5.x wird abgelehnt"    FEHLER "kein MAJOR.MINOR.PATCH" "$(lauf "$Z" pruefen 1.5.x)"
 erwarte "v1.5.0 wird abgelehnt"   FEHLER "kein MAJOR.MINOR.PATCH" "$(lauf "$Z" pruefen v1.5.0)"
+
+# Die Schranke gegen Leerraum und unsichtbare Zeichen. Bis zur Nacharbeit von
+# #80 war sie von KEINEM Fall gedeckt: Setzt man ihr Muster auf etwas, das nie
+# vorkommt, bleibt die Probe gruen, waehrend das Gate wieder sieben
+# Kaskadenzeilen erzeugt. Der Anlass des Slices selbst, ungeprueft eingebaut
+# (Blindpruefer 20.09.2026).
+MIT_UMBRUCH="1.5.0
+"
+erwarte "Version mit Zeilenumbruch wird abgelehnt" \
+  FEHLER "kein MAJOR.MINOR.PATCH" "$(lauf "$Z" pruefen "$MIT_UMBRUCH")"
+erwarte "Version mit Leerzeichen wird abgelehnt" \
+  FEHLER "kein MAJOR.MINOR.PATCH" "$(lauf "$Z" pruefen "1.5.0 ")"
+# Der Leerraum-Hinweis selbst war ungedeckt — dieselbe Klasse zum dritten Mal
+# in diesem Slice: Der neue Zweig wurde eingebaut und nicht geprueft
+# (Fremdpruefer 20.09.2026).
+LEER_AUS=$(lauf_status "$Z" pruefen "1.5.0 ")
+case "$LEER_AUS" in
+  *"Leerraum oder einen Zeilenumbruch"*)
+    printf '  bestanden   Leerraum bekommt den Leerraum-Hinweis
+'; GRUEN=$((GRUEN + 1)) ;;
+  *)
+    printf '  FEHLGESCHLAGEN  Leerraum ohne passenden Hinweis: %s
+' "$LEER_AUS"; ROT=$((ROT + 1)) ;;
+esac
+
+# Anlass: Der Owner rief am 07.09.2026 auf SEINEM Rechner `pruefen v1.6.0` auf
+# (nach einer falschen Anweisung von mir). Das Gate lehnte richtig ab — und
+# fuhr danach ALLE weiteren Pruefungen mit der unlesbaren Version weiter:
+# acht Fehlerzeilen, von denen sieben Folgen der ersten waren. Die Ursache
+# stand oben und ging in ihren eigenen Symptomen unter.
+#
+# Ein Gate, dessen Ausgabe man erst sortieren muss, hat seine Aufgabe
+# verfehlt. Deshalb drei Faelle, die den Abbruch festnageln:
+AUSG=$(lauf "$Z" pruefen v1.5.0)
+# `|| true`: `grep -c` gibt bei NULL Treffern Exit 1 zurueck, die Zuweisung
+# erbt ihn, und `set -e` beendet die Selbstprobe mitten im Lauf — ohne
+# Bilanzzeile, mit rund 50 nie gefahrenen Faellen und ohne Hinweis warum.
+# Gemessen von der blinden Panel-Stimme an genau diesem Fehlerbild.
+ANZAHL=$(echo "$AUSG" | grep -c "FEHLER" || true)
+if [ "$ANZAHL" = "1" ]; then
+  printf '  bestanden   %s
+' "ungueltige Version bricht ab statt zu kaskadieren (1 Fehlerzeile)"
+  GRUEN=$((GRUEN + 1))
+else
+  printf '  FEHLGESCHLAGEN  %s
+' "ungueltige Version bricht ab statt zu kaskadieren"
+  printf '      erwartet: genau 1 FEHLER-Zeile, gezaehlt: %s
+' "$ANZAHL"
+  echo "$AUSG" | sed 's/^/      | /'
+  ROT=$((ROT + 1))
+fi
+# Direkt geprueft statt ueber `erwarte`: Der Hinweis ist keine OK/FEHLER-Zeile,
+# und `erwarte` sucht genau nach dieser Form. Die erste Fassung dieses Falls
+# rief `erwarte` trotzdem auf und war deshalb rot — richtig rot, aber aus dem
+# falschen Grund.
+if echo "$AUSG" | grep -q "OHNE fuehrendes v"; then
+  printf '  bestanden   %s
+' "der Abbruch nennt die wahrscheinliche Ursache"
+  GRUEN=$((GRUEN + 1))
+else
+  printf '  FEHLGESCHLAGEN  %s
+' "der Abbruch nennt die wahrscheinliche Ursache"
+  echo "$AUSG" | sed 's/^/      | /'
+  ROT=$((ROT + 1))
+fi
+# Und die Kopfzeile darf bei ungueltiger Eingabe gar nicht erst erscheinen —
+# sie las sich vorher als "Release-Gate fuer vv1.5.0", also wie ein Tippfehler
+# des Skripts statt wie einer des Aufrufers.
+if echo "$AUSG" | grep -q "vv"; then
+  printf '  FEHLGESCHLAGEN  %s
+' "Kopfzeile zeigt kein doppeltes v"
+  echo "$AUSG" | sed 's/^/      | /'
+  ROT=$((ROT + 1))
+else
+  printf '  bestanden   %s
+' "Kopfzeile zeigt kein doppeltes v"
+  GRUEN=$((GRUEN + 1))
+fi
+
+# Die Argumentpruefung des Gates — bis zur Nacharbeit von #80 ebenfalls
+# ungedeckt, obwohl ihr Kommentar im Produkt sie ausfuehrlich begruendet. Sie
+# benutzt Exit 2 (Aufruffehler), nicht Exit 1 (Ablehnung), deshalb direkt
+# geprueft statt ueber `erwarte`.
+pruefe_aufruf() {
+  BESCHR=$1; shift
+  RC=0
+  ( cd "$Z" && PATH="$STUBS:$PATH" sh scripts/release.sh "$@" >/dev/null 2>&1 ) || RC=$?
+  if [ "$RC" = "2" ]; then
+    printf '  bestanden   %s\n' "$BESCHR"; GRUEN=$((GRUEN + 1))
+  else
+    printf '  FEHLGESCHLAGEN  %s (Exit %s statt 2)\n' "$BESCHR" "$RC"; ROT=$((ROT + 1))
+  fi
+}
+pruefe_aufruf "ein drittes Positionsargument wird abgelehnt" pruefen 1.5.0 9.9.9
+pruefe_aufruf "ein unbekannter Schalter wird abgelehnt"      pruefen 1.5.0 --gibt-es-nicht
+pruefe_aufruf "eine fehlende Version wird abgelehnt"         pruefen
+# Ein VERTIPPTER Befehl war vollstaendig ungedeckt: `*) exit 0` liess
+# `release.sh vertippt 1.5.0` wortlos mit Erfolg enden — ein Gate, das nichts
+# prueft und Erfolg meldet (Fremdpruefer 20.09.2026).
+pruefe_aufruf "ein unbekannter Befehl wird abgelehnt"        vertippt 1.5.0
+
+# Und die Diagnose gehoert dazu: Ein Exit 2 ohne Erklaerung schickt den
+# Aufrufer ins Leere.
+AUFRUF_AUS=$( cd "$Z" && PATH="$STUBS:$PATH" sh scripts/release.sh pruefen 2>&1 || true )
+case "$AUFRUF_AUS" in
+  *"Aufruf: sh scripts/release.sh"*)
+    printf '  bestanden   der Aufruffehler nennt die richtige Aufrufform
+'; GRUEN=$((GRUEN + 1)) ;;
+  *)
+    printf '  FEHLGESCHLAGEN  Aufruffehler ohne Aufrufform: %s
+' "$AUFRUF_AUS"; ROT=$((ROT + 1)) ;;
+esac
 
 echo "2  Oberster CHANGELOG-Eintrag"
 erwarte "passender Eintrag" OK "oberster Eintrag ist [1.5.0]" "$(lauf "$Z" pruefen 1.5.0)"
@@ -362,6 +591,21 @@ else
   printf '  FEHLGESCHLAGEN  gruenes Gate, aber Exit-Code != 0\n'; ROT=$((ROT + 1))
 fi
 
+# Der `bump`-Pfad ohne passenden Notizen-Eintrag ging bis zur zweiten
+# Nacharbeit von #80 an `erwarte` vorbei und prueste nur Text und
+# Dateizustand — die dritte Stelle derselben Defektklasse (Fremdpruefer
+# 20.09.2026). Hier als Wirkungspruefung nachgezogen.
+pruefe_wirkung() {
+  BESCHR=$1; ERWARTETER=$2; shift 2
+  RC=0
+  ( cd "$Z" && PATH="$STUBS:$PATH" sh scripts/release.sh "$@" >/dev/null 2>&1 ) || RC=$?
+  if [ "$RC" = "$ERWARTETER" ]; then
+    printf '  bestanden   %s\n' "$BESCHR"; GRUEN=$((GRUEN + 1))
+  else
+    printf '  FEHLGESCHLAGEN  %s (Exit %s statt %s)\n' "$BESCHR" "$RC" "$ERWARTETER"; ROT=$((ROT + 1))
+  fi
+}
+
 echo "10 bump schreibt nur, wenn die Notizen fuehren"
 ZB=$(baue f10 1.4.4 "$KOPF_GUT" "$RISIKO_GUT")
 AUSGABE=$(lauf "$ZB" bump 1.5.0)
@@ -495,6 +739,173 @@ git -C "$ZM6" -c user.email=p@example.invalid -c user.name=P commit -qam "drift"
 ueberlebt "die Versions-Gleichheit traegt" \
   "$(lauf "$ZM6" pruefen 1.5.0)" "erwartet 1.5.0"
 
+echo "13 Der Exit-Code — die einzige Antwort, auf die sich ein Aufrufer verlaesst"
+# Diese Faelle gab es bis zum 07.09.2026 NICHT. Dass ein ROTES Gate auch rot
+# zurueckgibt, war nie belegt — genau das traf die Mutation der blinden Stimme.
+#
+# Die erste Fassung dieses Kommentars behauptete, die Probe habe "58 Faelle
+# lang ausschliesslich Text geprueft". Das stimmt nicht: Der GRUENE Fall wurde
+# schon vor diesem Slice ueber den Exit-Code geprueft (Abschnitt 9). Falsch war
+# nur die rote Richtung. Nachgemessen, Blindpruefer 20.09.2026.
+ZE=$(baue f13 1.5.0 "$KOPF_GUT" "$RISIKO_GUT")
+stub_gh "$ZE" completed success
+
+ST=$(lauf_status "$ZE" pruefen 1.5.0)
+case "$ST" in
+  "0 "*) printf '  bestanden   gruenes Gate gibt 0 zurueck\n'; GRUEN=$((GRUEN + 1)) ;;
+  *) printf '  FEHLGESCHLAGEN  gruenes Gate gibt 0 zurueck (war: %s)\n' "$ST"; ROT=$((ROT + 1)) ;;
+esac
+
+ST=$(lauf_status "$ZE" pruefen v1.5.0)
+if gate_hat_abgelehnt "$ST"; then
+  printf '  bestanden   unlesbare Version: das Gate LEHNT AB, stirbt nicht bloss\n'; GRUEN=$((GRUEN + 1))
+else
+  printf '  FEHLGESCHLAGEN  unlesbare Version: %s\n' "$ST"; ROT=$((ROT + 1))
+fi
+
+# Der Produktwechsel DIESER Runde: Der Hinweis ist fallabhaengig geworden. Bis
+# eben deckte ihn kein einziger Fall — man konnte ihn wieder unbedingt machen,
+# und die Probe blieb 63/0 (Blindpruefer 20.09.2026).
+case "$ST" in
+  *"OHNE fuehrendes v"*)
+    printf '  bestanden   v-Eingabe bekommt den v-Hinweis\n'; GRUEN=$((GRUEN + 1)) ;;
+  *)
+    printf '  FEHLGESCHLAGEN  v-Eingabe ohne v-Hinweis: %s\n' "$ST"; ROT=$((ROT + 1)) ;;
+esac
+# Eine dritte v-Form, die in keinem Fixture vorkommt: Mit `v1.5.0|v1.6.0`
+# statt `v[0-9]*` blieben die beiden Faelle oben gruen (Fremdpruefer).
+STV=$(lauf_status "$ZE" pruefen v9.9.9)
+case "$STV" in
+  *"OHNE fuehrendes v"*)
+    printf '  bestanden   auch eine unbekannte v-Form bekommt den v-Hinweis\n'; GRUEN=$((GRUEN + 1)) ;;
+  *)
+    printf '  FEHLGESCHLAGEN  v9.9.9 ohne v-Hinweis: %s\n' "$STV"; ROT=$((ROT + 1)) ;;
+esac
+STX=$(lauf_status "$ZE" pruefen 1.5.x)
+case "$STX" in
+  *"OHNE fuehrendes v"*)
+    printf '  FEHLGESCHLAGEN  1.5.x bekommt faelschlich den v-Hinweis: %s\n' "$STX"; ROT=$((ROT + 1)) ;;
+  *"MAJOR.MINOR.PATCH aus Ziffern"*)
+    printf '  bestanden   Nicht-v-Eingabe bekommt den allgemeinen Hinweis\n'; GRUEN=$((GRUEN + 1)) ;;
+  *)
+    printf '  FEHLGESCHLAGEN  1.5.x ohne brauchbaren Hinweis: %s\n' "$STX"; ROT=$((ROT + 1)) ;;
+esac
+
+ZF=$(baue f13b 1.4.4 "$KOPF_GUT" "$RISIKO_GUT")
+ST=$(lauf_status "$ZF" pruefen 1.5.0)
+if gate_hat_abgelehnt "$ST"; then
+  printf '  bestanden   rotes Gate LEHNT AB, stirbt nicht bloss\n'; GRUEN=$((GRUEN + 1))
+else
+  printf '  FEHLGESCHLAGEN  rotes Gate: %s\n' "$ST"; ROT=$((ROT + 1))
+fi
+
+# bump gehoert genauso geprueft wie tag: Es SCHREIBT, und eine unlesbare
+# Version darf dabei nichts anfassen.
+#
+# Der CHANGELOG-Kopf traegt hier ABSICHTLICH die unlesbare Form. Sonst
+# blockiert die Notizen-Pruefung den Bump ohnehin, und der Fall waere gruen,
+# ohne die Formatschranke je zu beruehren.
+ZB=$(baue f13d 1.5.0 '## [v1.6.0] – 2026-09-06' "$RISIKO_GUT")
+# Alle DREI Versionsdateien, und zwar VORHER gegen NACHHER — nicht "steht der
+# alte Wert noch da".
+#
+# Die erste Fassung suchte die alten Werte im Inhalt. Das ist kein
+# Unveraendert-Beweis: Eine Mutation, die etwas ANHAENGT, laesst den alten Wert
+# stehen und kam damit durch — selbst gemessen, bevor es jemand anders fand.
+# Ein Vergleich des ganzen Inhalts kann das nicht.
+#
+# `|| true`, weil eine fehlende Datei sonst unter `set -e` die Probe vor der
+# Bilanz beendet.
+versionsdateien() {
+  { cat "$1/backend/version.py" "$1/frontend/src/version.ts" "$1/frontend/package.json"; } 2>&1 || true
+}
+VORHER=$(versionsdateien "$ZB")
+ST=$(lauf_status "$ZB" bump v1.6.0)
+NACHHER=$(versionsdateien "$ZB")
+UNVERAENDERT=0
+[ "$VORHER" = "$NACHHER" ] && UNVERAENDERT=1
+if gate_hat_abgelehnt "$ST" && [ "$UNVERAENDERT" = "1" ]; then
+  printf '  bestanden   bump mit unlesbarer Version schreibt nichts und lehnt ab\n'; GRUEN=$((GRUEN + 1))
+else
+  printf '  FEHLGESCHLAGEN  bump mit unlesbarer Version: %s\n' "$ST"
+  printf '      Versionsdateien danach:\n'; printf '%s\n' "$VORHER" | sed 's/^/      | /'
+  ROT=$((ROT + 1))
+fi
+# Die FRUEHE Formatschranke in `bump` isoliert: Faellt sie weg, uebernimmt die
+# Zaehlzeile dahinter — das Ergebnis bleibt "abgelehnt", aber die Meldung
+# erscheint ZWEIMAL. Genau daran war ihr Verlust bisher nicht zu erkennen
+# (Fremdpruefer 20.09.2026).
+ANZ=$(printf '%s' "$ST" | tr '|' '
+' | grep -c "ist kein MAJOR.MINOR.PATCH" || true)
+if [ "$ANZ" = "1" ]; then
+  printf '  bestanden   bump meldet den Formatfehler genau einmal
+'; GRUEN=$((GRUEN + 1))
+else
+  printf '  FEHLGESCHLAGEN  bump meldet den Formatfehler %sx — die fruehe Schranke fehlt
+' "$ANZ"; ROT=$((ROT + 1))
+fi
+# Nicht nur DASS bump ablehnt, sondern dass er SAGT warum. Loescht man die
+# Hinweiszeilen, bricht bump wortlos ab — und der Fall oben merkte es nicht.
+case "$ST" in
+  *"OHNE fuehrendes v"*)
+    printf '  bestanden   bump nennt die Ursache, statt wortlos abzubrechen\n'; GRUEN=$((GRUEN + 1)) ;;
+  *)
+    printf '  FEHLGESCHLAGEN  bump bricht ohne Begruendung ab: %s\n' "$ST"; ROT=$((ROT + 1)) ;;
+esac
+# ROT-BEWEIS-VERMERK, damit dieser Fall nicht als bewiesen gilt, ohne es zu
+# sein: `bump` ist tiefengestaffelt. Die Mutation "Abbruchblock entfernen"
+# laesst ihn NICHT durch — es greift die Zeile `[ "$FEHLER" -eq 0 ] || return 1`
+# unmittelbar danach. Rot wird der obere Fall erst, wenn BEIDE fallen.
+#
+# Die erste Fassung dieses Vermerks nannte stattdessen die Sammelpruefung vor
+# dem Schreiben ("Nichts geschrieben."). Das war falsch — und gefaehrlich
+# falsch: Wer die Zaehlzeile kuenftig fuer redundant haelt, weil der Vermerk
+# den Schutz woanders verortet, entfernt genau die tragende Schranke. In
+# diesem Fixture laeuft die Sammelpruefung gar nicht an, weil alle drei
+# Dateien vorhanden sind (Blindpruefer 20.09.2026).
+
+# Der Kern: Das Gate darf nach einem Abbruch NICHT taggen. Abschnitt 11 prueft
+# das nur fuer eine formatgueltige Version und laeuft deshalb gar nicht durch
+# den Abbruchpfad.
+ZT2=$(baue f13c 1.5.0 "$KOPF_GUT" "$RISIKO_GUT")
+ST=$(lauf_status "$ZT2" tag v1.5.0)
+# OHNE Pipe: `git tag -l | tr ...` liefert den Status von `tr`, nicht von
+# `git`. Ein gescheitertes `git` (kaputtes Repo) wurde damit zur leeren
+# Tagliste — also zu einem bestandenen Fall (Fremdpruefer 20.09.2026).
+TAGROH=$(git -C "$ZT2" tag -l) || TAGROH="GIT-FEHLER"
+TAGS=$(printf '%s' "$TAGROH" | tr '\n' ' ')
+if gate_hat_abgelehnt "$ST" && [ -z "$TAGS" ]; then
+  printf '  bestanden   tag mit unlesbarer Version setzt nichts und lehnt ab\n'; GRUEN=$((GRUEN + 1))
+else
+  printf '  FEHLGESCHLAGEN  tag mit unlesbarer Version: %s | Tags: %s\n' "$ST" "$TAGS"; ROT=$((ROT + 1))
+fi
 echo
 echo "$GRUEN bestanden, $ROT fehlgeschlagen"
+
+# MINDESTZAHL — ein Waechter gegen den stillen Verlust von Faellen.
+#
+# Der Abschluss prueft sonst nur `ROT = 0`, und damit ist 65/0 genauso gruen
+# wie 66/0: Wer einen Fall loescht, merkt es nicht (Fremdpruefer 20.09.2026).
+#
+# Die Zahl gehoert hierher und NICHT in einen Regeltext — hier ist sie ein
+# Waechter, dort waere sie eine Erinnerung, die mit jedem Fund veraltet
+# (lehren.md Paragraph 9). Wer Faelle ergaenzt, zieht sie mit.
+# Der Wert ist GEMESSEN, nicht geschaetzt: ein voller Lauf meldet 67. Die
+# erste Fassung dieser Zeile stand auf 70, weil ich sie geschrieben habe,
+# bevor ich gezaehlt hatte — dieselbe Reflexbewegung, die in diesem Repo schon
+# dreimal eine Zusage vor ihrer Messung erzeugt hat.
+#
+# "Mindestens", nicht "genau": Ein verlorener Fall faellt auf, ein
+# hinzugefuegter blockiert nicht.
+MINDESTENS=76
+if [ "$((GRUEN + ROT))" -lt "$MINDESTENS" ]; then
+  echo "FEHLER: nur $((GRUEN + ROT)) Faelle gelaufen, erwartet mindestens $MINDESTENS."
+  echo "        Ein Fall fehlt."
+  # Der Halbsatz "oder die Probe ist unterwegs gestorben" stand hier eine
+  # Fassung lang und war unerreichbar: Stirbt die Probe unter `set -e`, wird
+  # diese Zeile nie ausgefuehrt. Der Abbruch ist trotzdem rot — der Exit-Code
+  # traegt das —, aber nicht wegen dieser Pruefung (Blindpruefer 20.09.2026).
+  exit 1
+fi
+
 [ "$ROT" -eq 0 ] || exit 1
