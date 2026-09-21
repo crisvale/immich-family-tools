@@ -185,6 +185,8 @@ STATUSCODES = {
     "err_conditional_destination_ambiguous": 422,
     "err_conditional_destination_required": 422,
     "err_conditional_people_owner_only": 422,
+    "err_group_choice_conflict": 422,
+    "err_group_not_found": 404,
     "err_immich_request_failed": 502,
     "err_immich_unreachable": 422,
     "err_invalid_content_length": 400,

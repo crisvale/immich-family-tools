@@ -40,7 +40,21 @@ class ManagedAlbum(BaseModel):
     id: str                      # internal UUID
     match_id: str                # original match or manual ID
     album_id: str                # Immich album UUID (in owner account)
-    album_name: str
+    album_name: str              # reiner Anzeigetext — NICHT der Gruppenschluessel
+    # Stabile Gruppenkennung (#78). Alben mit derselben Kennung gehoeren
+    # zusammen; ihre Personen gelten als transitiv verbunden.
+    #
+    # PFLICHTFELD OHNE VORGABEWERT, und das ist Absicht: Ein
+    # `Optional[str] = None` gaebe jedem Album ohne Kennung denselben
+    # Schluessel und verschmoelze alle zu EINER Gruppe — genau der Defekt,
+    # den diese Kennung behebt, nur schlimmer. Eine vergessene Zuweisung
+    # muss laut scheitern. Fuer Altbestaende fuellt `_migrate()` das Feld.
+    #
+    # `min_length=1`, weil der Kommentar sonst mehr behauptet als der Typ
+    # haelt: Gemessen vom Panel blieb die Mutation `group_id=""` an beiden
+    # Erzeugungsstellen gruen — und eine leere Kennung tut genau das, wovor
+    # der Absatz oben warnt, nur ohne den lauten Fehler.
+    group_id: str = Field(min_length=1)
     owner_account_id: str        # account that owns the album
     person_refs: list[dict]      # [{"account_id", "person_id", "person_name", "account_name", "account_color"}]
     minimum_person_count: int = 1
@@ -100,6 +114,11 @@ class SyncNamesMultiRequest(BaseModel):
     album_name: Optional[str] = None           # if set, create new shared album
     existing_album_id: Optional[str] = None    # if set, link existing album instead
     owner_account_id: Optional[str] = None     # album owner; defaults to first person's account
+    # Ausdrueckliche Gruppenwahl (#81). Ohne beides entscheidet wie bisher
+    # der Name; `group_id` tritt einer BESTEHENDEN Gruppe bei, `force_new_group`
+    # erzwingt eine eigene. Beides zugleich wird abgelehnt.
+    group_id: Optional[str] = None
+    force_new_group: bool = False
 
 
 class ExtendMatchRequest(BaseModel):
@@ -115,6 +134,11 @@ class SyncAlbumRequest(BaseModel):
     owner_account_id: str
     album_name: Optional[str] = None        # for new album
     existing_album_id: Optional[str] = None # for linking existing album
+    # Ausdrueckliche Gruppenwahl (#81). Ohne beides entscheidet wie bisher
+    # der Name; `group_id` tritt einer BESTEHENDEN Gruppe bei, `force_new_group`
+    # erzwingt eine eigene. Beides zugleich wird abgelehnt.
+    group_id: Optional[str] = None
+    force_new_group: bool = False
 
 
 class SyncLogEntry(BaseModel):

@@ -250,6 +250,7 @@ async def create_shared_album(
     person_refs: list[dict],   # [{"account_id": ..., "person_id": ...}]
     album_name: str,
     store: ConfigStore,
+    group_id: str,
     minimum_person_count: int = 1,
     linked_person_ids: Optional[list[str]] = None,
     condition_person_count: Optional[int] = None,
@@ -355,6 +356,16 @@ async def create_shared_album(
         match_id=match_id,
         album_id=album_id,
         album_name=album_name,
+        # Die Kennung loest der AUFRUFER auf (ConfigStore.resolve_group_id),
+        # weil dort die ausdrueckliche Wahl des Nutzers ankommt (#81).
+        #
+        # PFLICHT, kein Rueckfall auf die Namensregel: Ein `or`-Rueckfall
+        # haette genau das getan, wovor der Kommentar am Modell warnt — wer
+        # die Wahl des Nutzers vergisst, bekaeme stilles Raten statt eines
+        # lauten Fehlers. Gemessen: Mit Rueckfall ueberlebte die Mutation
+        # "Router verwirft die aufgeloeste Kennung" die volle Suite
+        # (Gegenpruefer 21.09.2026).
+        group_id=group_id,
         owner_account_id=owner_account.id,
         person_refs=person_refs,
         minimum_person_count=minimum_person_count,
@@ -381,6 +392,7 @@ async def link_existing_album(
     all_accounts: list[Account],
     person_refs: list[dict],
     store: ConfigStore,
+    group_id: str,
     minimum_person_count: int = 1,
     linked_person_ids: Optional[list[str]] = None,
     condition_person_count: Optional[int] = None,
@@ -455,7 +467,8 @@ async def link_existing_album(
 
     managed = ManagedAlbum(
         id=str(uuid.uuid4()), match_id=match_id, album_id=album_id,
-        album_name=album_name, owner_account_id=owner_account.id,
+        album_name=album_name, group_id=group_id,
+        owner_account_id=owner_account.id,
         person_refs=person_refs, minimum_person_count=minimum_person_count,
         linked_person_ids=linked_person_ids or [],
         condition_person_count=(

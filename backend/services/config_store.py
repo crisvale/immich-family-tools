@@ -159,9 +159,204 @@ class ConfigStore:
                 })
                 changed = True
 
+        if self._backfill_group_ids(albums):
+            changed = True
+
         if changed:
             logger.info("Config migration applied; saving.")
             self._save()
+
+    @staticmethod
+    def _name_key(album_name: str) -> str:
+        """Die Normalisierung, die bis v1.6.0 der Gruppenschluessel WAR.
+
+        Sie lebt weiter — aber nur noch als Zuordnungshilfe beim Anlegen und
+        beim einmaligen Uebernehmen von Altbestaenden, nicht mehr als
+        Identitaet einer Gruppe.
+        """
+        # `str()` statt einer Typzusicherung: Ein handbearbeiteter Nicht-String
+        # (album_name: 42) liess die Wanderung bis zur zweiten Nacharbeit mit
+        # AttributeError abbrechen, und `_load` machte daraus ein
+        # "Configuration is invalid" — die App startete GAR NICHT MEHR, wo sie
+        # vorher startete und erst beim Lesen der Alben scheiterte. Eine
+        # Wanderung darf einen Bestand nicht unstartbar machen; die
+        # Typpruefung gehoert ins Modell, nicht hierher.
+        if album_name is None:
+            return ""
+        return str(album_name).strip().lower()
+
+    def _backfill_group_ids(self, albums: list[dict]) -> bool:
+        """Vergibt fehlende Gruppenkennungen aus der bisherigen Namensregel.
+
+        VERHALTENSERHALTEND, AUSDRUECKLICH AUCH IM FALSCHEN: Zwei Alben, die
+        zufaellig gleich heissen und nichts miteinander zu tun haben, bildeten
+        bis hierher EINE Gruppe (#78, Fall A). Diese Wanderung uebernimmt das
+        unveraendert. Aus den Daten allein ist nicht unterscheidbar, ob eine
+        Gruppe gewollt war, und eine bestehende Gruppe still zu zerlegen ist
+        der schwerere Fehler: Der Nutzer saehe Alben auseinanderfallen, ohne
+        etwas getan zu haben.
+
+        ZWEI AUSNAHMEN, in denen der Name NICHTS ueber Zugehoerigkeit sagt und
+        deshalb nicht geraten wird — beide vom Panel gemessen:
+
+        * MEHRDEUTIG: Tragen bereits zwei VERSCHIEDENE Gruppen denselben
+          Namen, haengte die erste Fassung ein kennungsloses Album still an
+          die in der Datei zuerst stehende. Vertauschte man zwei Zeilen,
+          kippte das Ergebnis. Ein Zufall der Dateireihenfolge darf keine
+          Zugehoerigkeit stiften.
+        * LEER: Ein leerer Name (auch reiner Leerraum) ist keine Aussage. Die
+          alte Namensregel verschmolz alle namenlosen Alben; das war
+          voruebergehend, weil ein Name es aufloeste. Eine Kennung friert es
+          dauerhaft ein.
+
+        In beiden Faellen bekommt das Album eine EIGENE Gruppe. Das ist die
+        einzige Abweichung von der Verhaltenserhaltung, und sie geht in die
+        sichere Richtung — nicht weil sich das eine rueckgaengig machen
+        liesse und das andere nicht (beides kann die App heute nicht), sondern
+        weil die Folgen verschieden SICHTBAR sind: Eine falsche Trennung zeigt
+        einen Vorschlag zu viel. Eine falsche Verschmelzung UNTERDRUECKT einen
+        Vorschlag, und nichts deutet darauf hin, dass er fehlt.
+
+        Zwei Durchgaenge, damit bereits vergebene Kennungen gewinnen. Sonst
+        bekaeme ein Album, das zwischen zwei Starts dazukommt, eine neue
+        Kennung und risse die Gruppe des ersten Starts entzwei.
+        """
+        bekannt = self._gruppen_je_name(albums)
+
+        # Kennungslose Alben gleichen Namens bilden untereinander eine Gruppe —
+        # das ist der Normalfall beim ersten Start, wo noch KEINE Kennung
+        # existiert und die alte Namensgruppierung uebernommen werden muss.
+        frisch: dict[str, str] = {}
+
+        changed = False
+        for album in albums:
+            if album.get("group_id"):
+                continue
+            schluessel = self._name_key(album.get("album_name", ""))
+            kandidaten = bekannt.get(schluessel, set())
+            if not schluessel or len(kandidaten) > 1:
+                album["group_id"] = str(uuid.uuid4())
+            elif len(kandidaten) == 1:
+                album["group_id"] = next(iter(kandidaten))
+            else:
+                album["group_id"] = frisch.setdefault(schluessel, str(uuid.uuid4()))
+            changed = True
+        return changed
+
+    def _gruppen_je_name(self, albums: list[dict]) -> dict[str, set[str]]:
+        """Normalisierter Name -> alle Gruppenkennungen, die ihn tragen.
+
+        Mehr als eine bedeutet: Der Name ist mehrdeutig geworden.
+        """
+        karte: dict[str, set[str]] = {}
+        for album in albums:
+            if album.get("group_id"):
+                karte.setdefault(self._name_key(album.get("album_name", "")),
+                                 set()).add(album["group_id"])
+        return karte
+
+    def existing_group_for_name(self, album_name: str) -> Optional[str]:
+        """Kennung der Gruppe mit diesem Namen — None, wenn keine oder mehrere.
+
+        Die ABFRAGE, getrennt von der VERGABE (#81). `group_id_for_name` gibt
+        bei Nicht-Treffer eine frische Kennung zurueck; fuer eine Vorschau
+        taugt das nicht, die braucht "trifft / trifft nicht".
+
+        Die beiden Ausnahmen aus #78 gelten unveraendert: Ein leerer und ein
+        mehrdeutiger Name sagen nichts ueber Zugehoerigkeit, also wird nicht
+        geraten.
+
+        BENANNTE DRITTE GRENZE, gemessen statt behauptet: Die Normalisierung
+        ist `strip().lower()` — keine Unicode-Normalform, kein `casefold`.
+        Zwei sichtbar gleiche Namen koennen daher als verschieden gelten
+        (NFC gegen NFD bei "Café", "istanbul" gegen "İstanbul", ein
+        unsichtbares Trennzeichen davor), und dann sagt diese Abfrage "keine
+        Gruppe", obwohl eine da ist. Das ist Erbe aus #78 — neu ist, dass
+        daraus seit #81 eine ZUSAGE AN DEN NUTZER wird. Als Folge-Issue
+        vermerkt, nicht hier behoben: Eine Normalisierung aendert die
+        Schluessel und ist damit selbst eine Datenwanderung.
+        """
+        schluessel = self._name_key(album_name)
+        if not schluessel:
+            return None
+        kandidaten = self._gruppen_je_name(self._data.get("managed_albums", [])).get(
+            schluessel, set()
+        )
+        return next(iter(kandidaten)) if len(kandidaten) == 1 else None
+
+    def group_details(self, group_id: str) -> dict:
+        """Wem tritt man bei — die Personen und Albumnamen einer Gruppe.
+
+        Ohne das waere die Bestaetigung beim Anlegen eine leere Geste: Der
+        Nutzer soll sehen, WEM er beitritt, nicht nur DASS er beitritt.
+
+        Die Personen werden ueber Konto UND Person entdoppelt; zwei
+        Immich-Instanzen koennen dieselbe Personen-Kennung vergeben.
+        """
+        alben = [a for a in self._data.get("managed_albums", [])
+                 if a.get("group_id") == group_id]
+        gesehen: set[str] = set()
+        refs: list[dict] = []
+        for album in alben:
+            for ref in album.get("person_refs", []):
+                schluessel = f"{ref.get('account_id')}::{ref.get('person_id')}"
+                if schluessel not in gesehen:
+                    gesehen.add(schluessel)
+                    refs.append(ref)
+        return {
+            "group_id": group_id,
+            "album_names": sorted({a.get("album_name", "") for a in alben}),
+            "person_refs": refs,
+        }
+
+    def resolve_group_id(self, album_name: str, *,
+                         chosen: Optional[str] = None,
+                         force_new: bool = False) -> str:
+        """Welche Gruppe es WIRKLICH wird — einziger Eigentuemer der Regel.
+
+        Ohne Angabe bleibt es beim heutigen Verhalten (der Name entscheidet).
+        Eine ausdrueckliche Wahl schlaegt den Namen; eine unbekannte Kennung
+        wird ABGELEHNT, statt eine Gruppe zu erfinden — sonst legt ein
+        Tippfehler eine Geistergruppe an, zu der nie ein zweites Album findet,
+        und niemand sieht es, weil das Anlegen gelingt.
+        """
+        import errors
+
+        # `is not None`, nicht Wahrheitswert: Eine ausdrueckliche leere
+        # Kennung ist eine ANGABE, keine Auslassung. Mit dem Wahrheitswert
+        # galt `group_id=""` als "nicht gesetzt" — der Widerspruch mit
+        # force_new_group wurde nicht erkannt, und die Namensregel griff
+        # still (Zweitstimme 21.09.2026, gemessen).
+        angegeben = chosen is not None
+        if angegeben and force_new:
+            raise errors.group_choice_conflict()
+        if force_new:
+            return str(uuid.uuid4())
+        if angegeben:
+            bekannt = {a.get("group_id") for a in self._data.get("managed_albums", [])}
+            if chosen not in bekannt:
+                raise errors.group_not_found(chosen)
+            return chosen
+        return self.group_id_for_name(album_name)
+
+    def group_id_for_name(self, album_name: str) -> str:
+        """Kennung der Gruppe mit diesem Namen — sonst eine neue.
+
+        Damit bleibt "Gruppieren durch gleiches Benennen" als Bedienmuster
+        erhalten: Wer ein zweites Album genauso nennt, tritt der bestehenden
+        Gruppe bei, wie bisher. Der Unterschied ist, dass die Zugehoerigkeit
+        ab dem Anlegen festliegt und ein spaeteres Umbenennen sie nicht mehr
+        aufloest.
+
+        Dieselben zwei Ausnahmen wie in `_backfill_group_ids`: Bei einem
+        mehrdeutigen oder leeren Namen wird nicht geraten, sondern eine eigene
+        Gruppe geoeffnet.
+
+        Einziger Eigentuemer dieser Regel — die Stellen, die frueher je eigene
+        Namensgruppen bildeten, fragen ab jetzt nur noch nach group_id.
+        """
+        treffer = self.existing_group_for_name(album_name)
+        return treffer if treffer else str(uuid.uuid4())
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

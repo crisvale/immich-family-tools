@@ -149,11 +149,21 @@ export interface Match {
   names_synced: boolean;
 }
 
+/** Die Gruppe, der ein neues Album beitreten wuerde (#81). */
+export interface AlbumGroupPreview {
+  group_id: string;
+  album_names: string[];
+  person_refs: ManagedAlbum["person_refs"];
+}
+
 export interface ManagedAlbum {
   id: string;
   match_id: string;
   album_id: string;
+  /** Reiner Anzeigetext — NICHT der Gruppenschluessel (siehe group_id). */
   album_name: string;
+  /** Stabile Gruppenkennung (#78). Alben mit gleicher Kennung gehoeren zusammen. */
+  group_id: string;
   owner_account_id: string;
   person_refs: {
     account_id: string;
@@ -166,7 +176,7 @@ export interface ManagedAlbum {
   created_at: string;
   last_synced_at?: string;
   total_assets: number;
-  minimum_person_count: number;
+  minimum_person_count?: number;
   condition_person_count?: number;
 }
 
@@ -261,6 +271,9 @@ export const api = {
       album_name?: string;
       existing_album_id?: string;
       owner_account_id?: string;
+      /** Ausdrueckliche Gruppenwahl (#81); ohne beides entscheidet der Name. */
+      group_id?: string;
+      force_new_group?: boolean;
     }) =>
       request<SyncLogEntry[]>("/sync/names-multi", {
         method: "POST",
@@ -271,6 +284,9 @@ export const api = {
       owner_account_id: string;
       album_name?: string;
       existing_album_id?: string;
+      /** Ausdrueckliche Gruppenwahl (#81); ohne beides entscheidet der Name. */
+      group_id?: string;
+      force_new_group?: boolean;
     }) =>
       request<SyncLogEntry[]>("/sync/album", {
         method: "POST",
@@ -281,6 +297,11 @@ export const api = {
         method: "POST",
         body: JSON.stringify(body),
       }),
+    /** Welcher Gruppe wuerde ein Album mit diesem Namen beitreten? null = keiner. */
+    albumGroupPreview: (albumName: string) =>
+      request<AlbumGroupPreview | null>(
+        `/sync/album-group?album_name=${encodeURIComponent(albumName)}`
+      ),
     refreshAlbum: (managedAlbumId: string) =>
       request<SyncLogEntry[]>(`/sync/album/${managedAlbumId}/refresh`, { method: "POST" }),
     albums: () => request<ManagedAlbum[]>("/sync/albums"),

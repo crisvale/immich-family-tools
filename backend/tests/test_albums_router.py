@@ -249,6 +249,7 @@ async def test_extend_endpoint_rejects_conditional_album():
         match_id="conditional_match",
         album_id="album-1",
         album_name="Family",
+        group_id="gruppe-family",
         owner_account_id="owner",
         person_refs=[],
         minimum_person_count=2,

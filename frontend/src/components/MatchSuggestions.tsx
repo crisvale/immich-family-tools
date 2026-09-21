@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Loader2,
@@ -19,6 +19,8 @@ import {
 import { api, Match, Account, ManagedAlbum, LinkedPerson } from "../api/client";
 import FaceCompare from "./FaceCompare";
 import { useT, type ServerErrorLike } from "../i18n";
+import { createGroupLookup } from "../lib/albumGroups";
+import { GruppenWahl } from "./GruppenWahl";
 
 // ── Album Dialog ───────────────────────────────────────────────────────────
 
@@ -36,6 +38,8 @@ function AlbumDialog({
     owner_account_id: string;
     album_name?: string;
     existing_album_id?: string;
+    force_new_group?: boolean;
+    group_id?: string;
   }) => void;
   onCancel: () => void;
   isPending: boolean;
@@ -47,6 +51,8 @@ function AlbumDialog({
   const [albumName, setAlbumName] = useState(defaultName);
   const [ownerAccountId, setOwnerAccountId] = useState(match.person_a.account_id);
   const [existingAlbumId, setExistingAlbumId] = useState("");
+  const [ownGroup, setOwnGroup] = useState(false);
+  const [gruppeId, setGruppeId] = useState<string | null>(null);
 
   const { data: existingAlbums = [], isFetching: loadingAlbums } = useQuery({
     queryKey: ["account-albums", ownerAccountId],
@@ -55,15 +61,29 @@ function AlbumDialog({
     staleTime: 30_000,
   });
 
+  const gewaehltesAlbum = existingAlbums.find((a) => a.id === existingAlbumId);
+  const wirksamerName = mode === "new" ? albumName : (gewaehltesAlbum?.name ?? "");
+
   const handleSubmit = () => {
+    // GruppenWahl setzt `ownGroup` zurueck, sobald keine Gruppe mehr getroffen
+    // wird — hier steht deshalb keine zweite Bedingung, die auseinanderlaufen
+    // koennte.
+    // Was angezeigt wurde, wird geschickt: entweder ausdruecklich diese
+    // Gruppe oder ausdruecklich eine eigene. Ohne Treffer bleibt es beim
+    // bisherigen Verhalten (der Name entscheidet).
+    const gruppenwahl = ownGroup
+      ? { force_new_group: true }
+      : gruppeId
+        ? { group_id: gruppeId }
+        : {};
     if (mode === "new") {
-      onSubmit({ owner_account_id: ownerAccountId, album_name: albumName });
+      onSubmit({ owner_account_id: ownerAccountId, album_name: albumName, ...gruppenwahl });
     } else {
-      const selected = existingAlbums.find((a) => a.id === existingAlbumId);
       onSubmit({
         owner_account_id: ownerAccountId,
         existing_album_id: existingAlbumId,
-        album_name: selected?.name,
+        album_name: gewaehltesAlbum?.name,
+        ...gruppenwahl,
       });
     }
   };
@@ -136,6 +156,13 @@ function AlbumDialog({
           )}
         </div>
       )}
+
+      <GruppenWahl
+        albumName={wirksamerName}
+        eigeneGruppe={ownGroup}
+        onEigeneGruppeChange={setOwnGroup}
+        onGruppeChange={setGruppeId}
+      />
 
       <p className="text-xs text-gray-600">
         {mode === "new" ? t("album_new_desc") : t("album_existing_desc")}
@@ -232,6 +259,14 @@ function MatchCard({
       owner_account_id: string;
       album_name?: string;
       existing_album_id?: string;
+      // Der Vollstaendigkeit halber, NICHT als Schutz: Eine fruehere Fassung
+      // dieses Kommentars behauptete, ohne diese Zeilen wuerden die Felder
+      // "still verschwinden". Das ist falsch — Typen existieren zur Laufzeit
+      // nicht, der Spread unten uebertraegt sie ohnehin. Zwei Panel-Stimmen
+      // haben es unabhaengig nachgemessen: Typ entfernt, `tsc` exit 0, alle
+      // Tests gruen, Feld kommt an. Wahr bleibt nur, dass `tsc` schweigt.
+      force_new_group?: boolean;
+      group_id?: string;
     }) => api.sync.album({ match_id: match.id, ...body }),
     onSuccess: (entries) => {
       const ok = entries.every((e) => e.status === "success");
@@ -595,20 +630,8 @@ export default function MatchSuggestions() {
     },
   });
 
-  // Precompute transitive person groups: normalised album-name → Set<person_id>
-  // Same logic as backend _enrich — group albums by name, collect all person_ids.
-  // Used to find the managed album for a match and to count group size.
-  const albumNameGroups = useMemo(() => {
-    const map = new Map<string, Set<string>>();
-    for (const album of managedAlbums) {
-      const key = album.album_name.trim().toLowerCase();
-      if (!map.has(key)) map.set(key, new Set());
-      for (const ref of album.person_refs) {
-        map.get(key)!.add(ref.person_id);
-      }
-    }
-    return map;
-  }, [managedAlbums]);
+  // Einmal je Zeichnung, nicht je Zeile — siehe createGroupLookup.
+  const gruppenSuche = useMemo(() => createGroupLookup(managedAlbums), [managedAlbums]);
 
   const displayed = useMemo(() => {
     const pool = filters.showDismissed ? matches : pending;
@@ -682,20 +705,14 @@ export default function MatchSuggestions() {
       ) : (
         <div className="space-y-4">
           {displayed.map((m) => {
-            // Find the album whose name-group contains BOTH persons of this match.
-            // Uses transitive person-ref lookup (same principle as backend _enrich)
-            // so this works even if linked_match_ids is stale or missing.
-            const managedAlbum = managedAlbums
-              .filter((a) => {
-                const group = albumNameGroups.get(a.album_name.trim().toLowerCase());
-                return group?.has(m.person_a.person_id) && group?.has(m.person_b.person_id);
-              })
-              .sort((a, b) => b.person_refs.length - a.person_refs.length)[0];
-
-            // Total unique persons in this album's name-group
-            const groupPersonCount = managedAlbum
-              ? (albumNameGroups.get(managedAlbum.album_name.trim().toLowerCase())?.size ?? 0)
-              : 0;
+            // Das Album, dessen GRUPPE beide Personen dieses Matches enthaelt,
+            // und die Groesse dieser Gruppe. Die Regel liegt in
+            // lib/albumGroups und ist dort geprueft — hier steht nur noch der
+            // Aufruf (#78, Nacharbeit).
+            const { album: managedAlbum, groupPersonCount } = gruppenSuche.forPair(
+              m.person_a.person_id,
+              m.person_b.person_id
+            );
 
             return (
               <MatchCard

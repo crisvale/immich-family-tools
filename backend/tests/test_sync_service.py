@@ -57,6 +57,9 @@ async def test_album_is_shared_only_with_participants(monkeypatch):
         def add_managed_album(self, _album):
             pass
 
+        def group_id_for_name(self, _name):
+            return "gruppe-testdoppel"
+
     monkeypatch.setattr(sync_service, "ImmichClient", Client)
     monkeypatch.setattr(sync_service, "_share_album_if_needed", fake_share)
     refs = [
@@ -64,7 +67,8 @@ async def test_album_is_shared_only_with_participants(monkeypatch):
         {"account_id": "participant", "person_id": "p2"},
     ]
     await sync_service.create_shared_album(
-        "match", owner, [owner, participant, unrelated], refs, "Album", Store()
+        "match", owner, [owner, participant, unrelated], refs, "Album", Store(),
+        group_id="gruppe-testdoppel",
     )
     assert captured == ["participant"]
 
@@ -129,7 +133,8 @@ async def test_conditional_album_with_three_people_includes_assets_seen_for_at_l
     monkeypatch.setattr(sync_service, "_share_album_if_needed", skip_sharing)
 
     managed, _ = await sync_service.create_shared_album(
-        "conditional", owner, [owner], refs, "Family", Store(), minimum_person_count=2
+        "conditional", owner, [owner], refs, "Family", Store(),
+        group_id="gruppe-family", minimum_person_count=2,
     )
 
     assert created_assets == ["together-12", "together-123"]
@@ -167,7 +172,8 @@ async def test_conditional_album_does_not_create_empty_album_when_person_search_
     monkeypatch.setattr(sync_service, "ImmichClient", Client)
 
     managed, logs = await sync_service.create_shared_album(
-        "conditional", owner, [owner], refs, "Family", Store(), minimum_person_count=2
+        "conditional", owner, [owner], refs, "Family", Store(),
+        group_id="gruppe-family", minimum_person_count=2,
     )
 
     assert managed is None
@@ -213,6 +219,7 @@ async def test_conditional_album_refresh_reapplies_threshold(monkeypatch):
         match_id="conditional",
         album_id="album",
         album_name="Family",
+        group_id="gruppe-family",
         owner_account_id=owner.id,
         person_refs=[
             {"account_id": owner.id, "person_id": "p1"},
@@ -261,7 +268,7 @@ async def test_existing_album_applies_threshold_per_account(monkeypatch):
             {"account_id": owner.id, "person_id": "a2"},
             {"account_id": other.id, "person_id": "b1"},
             {"account_id": other.id, "person_id": "b2"},
-        ], Store(), minimum_person_count=2,
+        ], Store(), group_id="gruppe-family", minimum_person_count=2,
         linked_person_ids=["l1", "l2"], condition_person_count=2,
     )
     assert add_calls == [["a-both"], ["b-both"]]
@@ -273,6 +280,7 @@ async def test_existing_album_applies_threshold_per_account(monkeypatch):
 def test_legacy_managed_album_derives_condition_person_count():
     managed = ManagedAlbum(
         id="legacy", match_id="match", album_id="album", album_name="Legacy",
+        group_id="gruppe-legacy",
         owner_account_id="owner", person_refs=[
             {"account_id": "owner", "person_id": "p1"},
             {"account_id": "owner", "person_id": "p2"},
@@ -311,6 +319,7 @@ async def test_refresh_does_not_readd_assets_already_in_the_album(monkeypatch):
         match_id="match-1",
         album_id="album-1",
         album_name="Family",
+        group_id="gruppe-family",
         owner_account_id=owner.id,
         person_refs=[{"account_id": owner.id, "person_id": "person-1"}],
         created_at="2026-08-02T00:00:00+00:00",
@@ -356,6 +365,7 @@ async def test_refresh_adds_only_new_assets_and_updates_the_total(monkeypatch):
         match_id="match-1",
         album_id="album-1",
         album_name="Family",
+        group_id="gruppe-family",
         owner_account_id=owner.id,
         person_refs=[{"account_id": owner.id, "person_id": "person-1"}],
         created_at="2026-08-02T00:00:00+00:00",
@@ -403,6 +413,7 @@ async def test_refresh_reports_partial_failures_and_ignores_duplicates(monkeypat
         match_id="match-1",
         album_id="album-1",
         album_name="Family",
+        group_id="gruppe-family",
         owner_account_id=owner.id,
         person_refs=[{"account_id": owner.id, "person_id": "person-1"}],
         created_at="2026-08-02T00:00:00+00:00",
@@ -464,6 +475,7 @@ async def test_extend_match_adds_only_assets_missing_from_the_album(monkeypatch)
         match_id="match-1",
         album_id="album-1",
         album_name="Family",
+        group_id="gruppe-family",
         owner_account_id=owner.id,
         person_refs=[{"account_id": owner.id, "person_id": "person-1"}],
         created_at="2026-08-02T00:00:00+00:00",
@@ -484,3 +496,187 @@ async def test_extend_match_adds_only_assets_missing_from_the_album(monkeypatch)
 
     assert add_calls == [["asset-2"]]
     assert managed.total_assets == 2
+
+
+# ----------------------------------------------------------------------
+# Verdrahtung der Gruppenkennung (#78)
+#
+# Die Regel selbst deckt test_config_store ab. Hier geht es um die
+# VERDRAHTUNG an der Erzeugungsstelle — die Luecke, die das Panel gemessen
+# hat: Beide Zuweisungen durch eine feste Kennung ersetzt, und die volle
+# Suite blieb gruen, weil das Store-Doppel oben eine Konstante liefert und
+# damit genau das verdeckt, was zu pruefen waere.
+#
+# Deshalb hier ein ECHTER ConfigStore, kein Doppel.
+# ----------------------------------------------------------------------
+
+
+def _store_mit_album(tmp_path, album_name: str, group_id: str):
+    import json
+
+    from services.config_store import ConfigStore
+
+    pfad = tmp_path / "accounts.json"
+    pfad.write_text(json.dumps({
+        "accounts": {},
+        "managed_albums": [{
+            "id": "vorhanden", "match_id": "m-alt", "album_id": "ia-alt",
+            "album_name": album_name, "group_id": group_id,
+            "owner_account_id": "owner", "person_refs": [],
+            "created_at": "2026-01-01T00:00:00+00:00", "last_synced_at": None,
+            "total_assets": 0, "status": "active",
+        }],
+    }), encoding="utf-8")
+    return ConfigStore(str(pfad))
+
+
+async def _lege_album_an(monkeypatch, store, album_name: str):
+    class Client:
+        def __init__(self, *_a, **_k):
+            pass
+
+        async def create_album(self, _name, _ids):
+            return {"id": "neues-immich-album"}
+
+        async def get_person_assets(self, _pid):
+            return []
+
+    async def fake_share(*_a, **_k):
+        return []
+
+    monkeypatch.setattr(sync_service, "ImmichClient", Client)
+    monkeypatch.setattr(sync_service, "_share_album_if_needed", fake_share)
+    owner = account("owner")
+    # Wie ein echter Aufrufer: erst aufloesen, dann uebergeben. Die Kennung
+    # ist Pflicht — es gibt keinen stillen Rueckfall mehr.
+    return await sync_service.create_shared_album(
+        "match-neu", owner, [owner],
+        [{"account_id": "owner", "person_id": "p1"}],
+        album_name, store,
+        group_id=store.resolve_group_id(album_name),
+    )
+
+
+@pytest.mark.asyncio
+async def test_neues_album_tritt_der_gruppe_mit_gleichem_namen_bei(monkeypatch, tmp_path):
+    """Die Zuordnungsregel muss beim Anlegen WIRKLICH angewandt werden."""
+    store = _store_mit_album(tmp_path, "Testalbum", "gruppe-1")
+
+    managed, _ = await _lege_album_an(monkeypatch, store, "  TESTALBUM ")
+
+    assert managed.group_id == "gruppe-1"
+
+
+@pytest.mark.asyncio
+async def test_neues_album_mit_neuem_namen_oeffnet_eine_eigene_gruppe(monkeypatch, tmp_path):
+    store = _store_mit_album(tmp_path, "Testalbum", "gruppe-1")
+
+    managed, _ = await _lege_album_an(monkeypatch, store, "Ganz anders")
+
+    assert managed.group_id
+    assert managed.group_id != "gruppe-1"
+
+
+@pytest.mark.asyncio
+async def test_neues_album_landet_mit_seiner_kennung_im_speicher(monkeypatch, tmp_path):
+    """Die Kennung muss auch GESPEICHERT werden, nicht nur zurueckgegeben."""
+    store = _store_mit_album(tmp_path, "Testalbum", "gruppe-1")
+
+    managed, _ = await _lege_album_an(monkeypatch, store, "Testalbum")
+
+    gespeichert = {a.id: a.group_id for a in store.get_managed_albums()}
+    assert gespeichert[managed.id] == "gruppe-1"
+
+
+@pytest.mark.asyncio
+async def test_verknuepftes_album_tritt_der_gruppe_mit_gleichem_namen_bei(monkeypatch, tmp_path):
+    """Auch der Verknuepfungspfad muss die Zuordnungsregel anwenden.
+
+    `link_existing_album` hatte bis zur Nacharbeit KEINEN einzigen Test
+    (Blindpruefer 20.09.2026); die Mutation `group_id="feste-falsche-kennung"`
+    an dieser Stelle blieb gruen, waehrend dieselbe Mutation an
+    `create_shared_album` gefangen wurde. Eine Defektklasse an der kleineren
+    Stelle behoben und an der groesseren stehen gelassen — genau das Muster,
+    das dieses Projekt schon mehrfach getroffen hat.
+    """
+    store = _store_mit_album(tmp_path, "Testalbum", "gruppe-1")
+
+    class Client:
+        def __init__(self, *_a, **_k):
+            pass
+
+        async def get_album_assets(self, _album_id):
+            return []
+
+        async def get_person_assets(self, _pid):
+            return []
+
+        async def add_assets_to_album(self, _album_id, _ids):
+            return []
+
+    async def fake_share(*_a, **_k):
+        return []
+
+    monkeypatch.setattr(sync_service, "ImmichClient", Client)
+    monkeypatch.setattr(sync_service, "_share_album_if_needed", fake_share)
+    owner = account("owner")
+
+    managed, _ = await sync_service.link_existing_album(
+        match_id="match-verknuepft",
+        owner_account=owner,
+        album_id="immich-bestehend",
+        album_name="  TESTALBUM ",
+        all_accounts=[owner],
+        person_refs=[{"account_id": "owner", "person_id": "p1"}],
+        store=store,
+        group_id=store.resolve_group_id("  TESTALBUM "),
+    )
+
+    assert managed is not None
+    assert managed.group_id == "gruppe-1"
+
+
+@pytest.mark.asyncio
+async def test_verknuepfen_folgt_der_uebergebenen_kennung(monkeypatch, tmp_path):
+    """Die uebergebene Gruppe schlaegt den Namen — auch beim Verknuepfen.
+
+    Gemessen vom Blindpruefer: Die Mutation, die `group_id` hier verwirft und
+    wieder ueber den Namen aufloest, ueberlebte die volle Suite. Der
+    vorhandene Test reichte nicht, weil er die Kennung gar nicht uebergab und
+    damit nur den Rueckfall pruefte.
+    """
+    store = _store_mit_album(tmp_path, "Testalbum", "gruppe-1")
+
+    class Client:
+        def __init__(self, *_a, **_k):
+            pass
+
+        async def get_album_assets(self, _album_id):
+            return []
+
+        async def get_person_assets(self, _pid):
+            return []
+
+        async def add_assets_to_album(self, _album_id, _ids):
+            return []
+
+    async def fake_share(*_a, **_k):
+        return []
+
+    monkeypatch.setattr(sync_service, "ImmichClient", Client)
+    monkeypatch.setattr(sync_service, "_share_album_if_needed", fake_share)
+    owner = account("owner")
+
+    managed, _ = await sync_service.link_existing_album(
+        match_id="match-verknuepft",
+        owner_account=owner,
+        album_id="immich-bestehend",
+        album_name="Testalbum",          # wuerde gruppe-1 treffen
+        all_accounts=[owner],
+        person_refs=[{"account_id": "owner", "person_id": "p1"}],
+        store=store,
+        group_id="eigene-gruppe",        # schlaegt den Namen
+    )
+
+    assert managed is not None
+    assert managed.group_id == "eigene-gruppe"

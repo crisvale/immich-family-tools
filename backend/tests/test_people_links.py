@@ -97,7 +97,7 @@ def test_conditional_album_only_links_profiles_within_each_logical_person(tmp_pa
     ])
     album = ManagedAlbum(
         id="managed", match_id="conditional_rule", album_id="album",
-        album_name="Family", owner_account_id="a",
+        album_name="Family", group_id="gruppe-family", owner_account_id="a",
         person_refs=[ref.model_dump() for link in (alex, sam) for ref in link.person_refs],
         linked_person_ids=[alex.id, sam.id], condition_person_count=2,
         minimum_person_count=2, created_at="2026-09-10T00:00:00+00:00",
