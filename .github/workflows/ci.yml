@@ -91,6 +91,17 @@ jobs:
       # faehrt echte Commits in Wegwerf-Repos und prueft, was git SPEICHERT,
       # nicht nur, was der Hook sieht.
       - run: sh scripts/commit-msg-selbstprobe.sh
+      # Die Selbstprobe der Faltungs-Sonde (#83). Dieselbe Begruendung, und
+      # hier besonders scharf: Die Sonde traegt eine Owner-Entscheidung ueber
+      # eine UNUMKEHRBARE Datenwanderung. Ihre erste Fassung meldete
+      # "folgenlos" fuer einen Bestand, in dem sich sehr wohl etwas aendert —
+      # gefunden von zwei Pruefstimmen, nicht von ihren eigenen gruenen
+      # Proben. Braucht kein Netz und kein gh. EIN Fall vergleicht die
+      # nachgebaute Faltung mit der echten aus `config_store` und faellt
+      # ohne installiertes Backend weg — die Probe bleibt dann gruen und
+      # sagt es ("uebersprungen"). Die erste Fassung machte daraus Rot,
+      # weil die Mindestzahl den ausgelassenen Fall mitzaehlte.
+      - run: python scripts/faltung-sonde-selbsttest.py
 
   frontend:
     runs-on: ubuntu-latest
