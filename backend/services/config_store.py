@@ -682,12 +682,43 @@ class ConfigStore:
     def get_linked_person(self, linked_person_id: str) -> Optional[LinkedPerson]:
         return next((item for item in self.get_linked_people() if item.id == linked_person_id), None)
 
+    def linked_person_conflicts(
+        self,
+        person_refs: list[MultiSyncPersonEntry | dict],
+    ) -> bool:
+        """Return whether refs would merge incompatible linked identities."""
+        keys = {
+            (
+                raw.account_id if hasattr(raw, "account_id") else raw["account_id"],
+                raw.person_id if hasattr(raw, "person_id") else raw["person_id"],
+            )
+            for raw in person_refs
+        }
+        overlapping = [
+            link for link in self.get_linked_people()
+            if keys & {(ref.account_id, ref.person_id) for ref in link.person_refs}
+        ]
+        if len(overlapping) > 1:
+            return True
+        if not overlapping:
+            return False
+        by_account = {
+            ref.account_id: ref.person_id for ref in overlapping[0].person_refs
+        }
+        return any(
+            account_id in by_account and by_account[account_id] != person_id
+            for account_id, person_id in keys
+        )
+
     def ensure_linked_person(
         self,
         display_name: str,
         person_refs: list[MultiSyncPersonEntry | dict],
     ) -> LinkedPerson:
         """Create, reuse, or compatibly extend a cross-account identity."""
+        if self.linked_person_conflicts(person_refs):
+            raise ValueError("profiles belong to incompatible linked people")
+
         normalized: list[PersonRef] = []
         for raw in person_refs:
             payload = raw.model_dump() if hasattr(raw, "model_dump") else dict(raw)
@@ -705,13 +736,10 @@ class ConfigStore:
             link for link in links
             if keys & {(ref.account_id, ref.person_id) for ref in link.person_refs}
         ]
-        if len(overlapping) > 1:
-            raise ValueError("profiles belong to incompatible linked people")
 
         if overlapping:
             link = overlapping[0]
             merged = list(link.person_refs)
-            by_account = {ref.account_id: ref.person_id for ref in merged}
             existing_keys = {(ref.account_id, ref.person_id) for ref in merged}
             changed = False
             normalized_name = display_name.strip()
@@ -719,13 +747,9 @@ class ConfigStore:
                 link.display_name = normalized_name
                 changed = True
             for ref in normalized:
-                current = by_account.get(ref.account_id)
-                if current is not None and current != ref.person_id:
-                    raise ValueError("linked person already has another profile for this account")
                 if (ref.account_id, ref.person_id) not in existing_keys:
                     merged.append(ref)
                     existing_keys.add((ref.account_id, ref.person_id))
-                    by_account[ref.account_id] = ref.person_id
                     changed = True
             if changed:
                 link.person_refs = merged

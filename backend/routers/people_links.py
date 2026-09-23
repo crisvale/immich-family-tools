@@ -39,22 +39,21 @@ async def create_person_link(body: LinkedPersonCreate, request: Request):
     display_name = (body.display_name or "").strip()
     if not display_name:
         display_name = next((name for _, _, name in validated if name), "Linked person")
-    try:
-        return store.ensure_linked_person(
-            display_name,
-            [{
-                "account_id": account_id,
-                "person_id": person_id,
-                "person_name": name,
-                "account_name": store.get_account(account_id).name,
-                "account_color": store.get_account(account_id).color,
-            } for account_id, person_id, name in validated],
-        )
-    except ValueError:
+    person_refs = [{
+        "account_id": account_id,
+        "person_id": person_id,
+        "person_name": name,
+        "account_name": store.get_account(account_id).name,
+        "account_color": store.get_account(account_id).color,
+    } for account_id, person_id, name in validated]
+    if store.linked_person_conflicts(person_refs):
         raise errors.linked_person_conflict()
+    return store.ensure_linked_person(display_name, person_refs)
 
 
 @router.delete("/{linked_person_id}", status_code=204)
 async def delete_person_link(linked_person_id: str, request: Request):
-    if not request.app.state.store.delete_linked_person(linked_person_id):
+    store = request.app.state.store
+    if not store.get_linked_person(linked_person_id):
         raise errors.linked_person_not_found()
+    store.delete_linked_person(linked_person_id)
